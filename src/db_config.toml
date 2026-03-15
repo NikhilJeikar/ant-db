@@ -1,0 +1,3 @@
+wal_path = "my_wal.log"
+snapshot_path = "my_snapshot.db"
+wal_threshold = 2097152
