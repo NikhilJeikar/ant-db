@@ -1,37 +1,81 @@
-use std::sync::{Arc, RwLock, Mutex};
-use tracing::{info, error};
+use std::sync::{Arc, Mutex, RwLock};
+use tracing::{error, info};
 
 use crate::backend::config::{Config, InternalStateManager};
-use crate::backend::logger::init_logger;
-use crate::backend::storage::snapshot::read_snapshot;
-use crate::backend::storage::wal::replay_wal;
 use crate::backend::core::database::InternalDatabaseSchema;
+use crate::backend::logger::{LoggerHandle, init_logger};
+use crate::backend::storage::snapshot::{read_snapshot_with_context, start_snapshot_monitor};
+use crate::backend::storage::wal::{WALManager, replay_wal};
 
-pub fn setup() -> (Arc<RwLock<InternalStateManager>>, Arc<Mutex<crate::backend::storage::wal::WALManager>>, InternalDatabaseSchema) {
-    let config = Config::from_file("config.toml");
-    let internal_state_manager = Arc::new(RwLock::new(InternalStateManager::new(config)));
-    let wal_manager = Arc::new(Mutex::new(crate::backend::storage::wal::WALManager::new(internal_state_manager.read().unwrap().config.wal_path.as_str())));
-    let _logger_guard = init_logger(internal_state_manager.read().unwrap().config.log_path.as_str());
-
-    let mut db =  if internal_state_manager.read().unwrap().config.snapshot_path.is_empty() {
+pub fn setup() -> (
+    Arc<RwLock<InternalStateManager>>,
+    Arc<Mutex<WALManager>>,
+    Arc<RwLock<InternalDatabaseSchema>>,
+    Arc<std::sync::atomic::AtomicBool>,
+    LoggerHandle,
+) {
+    let config = Config::from_file("db_config.toml");
+    let internal_state_manager = Arc::new(RwLock::new(InternalStateManager::new(config.clone())));
+    let wal_manager = Arc::new(Mutex::new(WALManager::new(
+        internal_state_manager.read().unwrap().config.clone(),
+    )));
+    let logger_handle = init_logger(
+        internal_state_manager
+            .read()
+            .unwrap()
+            .config
+            .log_path
+            .as_str(),
+    );
+    info!("Configuration loaded: {:?}", config);
+    let mut db = if internal_state_manager
+        .read()
+        .unwrap()
+        .config
+        .snapshot_path
+        .is_empty()
+    {
         info!("No snapshot path provided, starting with empty database");
         InternalDatabaseSchema::new(internal_state_manager.clone(), wal_manager.clone())
     } else {
-        info!("Reading snapshot from {}", internal_state_manager.read().unwrap().config.snapshot_path);
-        match read_snapshot(internal_state_manager.read().unwrap().config.snapshot_path.as_str()) {
+        info!(
+            "Reading snapshot from {}",
+            internal_state_manager.read().unwrap().config.snapshot_path
+        );
+        match read_snapshot_with_context(
+            internal_state_manager
+                .read()
+                .unwrap()
+                .config
+                .snapshot_path
+                .as_str(),
+            internal_state_manager.clone(),
+            wal_manager.clone(),
+        ) {
             Ok(db) => {
                 info!("Snapshot loaded successfully");
                 db
-            },
+            }
             Err(e) => {
-                error!("Failed to read snapshot: {}, starting with empty database", e);
+                error!(
+                    "Failed to read snapshot: {}, starting with empty database",
+                    e
+                );
                 InternalDatabaseSchema::new(internal_state_manager.clone(), wal_manager.clone())
             }
         }
     };
     internal_state_manager.write().unwrap().is_wal_replaying = true;
 
-    match replay_wal(&mut db, internal_state_manager.read().unwrap().config.wal_path.as_str()) {
+    match replay_wal(
+        &mut db,
+        internal_state_manager
+            .read()
+            .unwrap()
+            .config
+            .wal_path
+            .as_str(),
+    ) {
         Ok(_) => {
             info!("WAL replay completed successfully");
         }
@@ -41,5 +85,25 @@ pub fn setup() -> (Arc<RwLock<InternalStateManager>>, Arc<Mutex<crate::backend::
     }
 
     internal_state_manager.write().unwrap().is_wal_replaying = false;
-    (internal_state_manager, wal_manager, db)
+    db.wal_manager = wal_manager.clone();
+
+    // Wrap database in Arc<RwLock<>> for thread-safe sharing
+    let db_arc = Arc::new(RwLock::new(db));
+
+    // Start the snapshot monitor thread
+    let snapshot_monitor_shutdown = start_snapshot_monitor(
+        wal_manager.clone(),
+        db_arc.clone(),
+        5, // Check every 5 seconds (configurable)
+    );
+
+    info!("Snapshot monitor started with 5 second check interval");
+
+    (
+        internal_state_manager,
+        wal_manager,
+        db_arc,
+        snapshot_monitor_shutdown,
+        logger_handle,
+    )
 }

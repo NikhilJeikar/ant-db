@@ -1,0 +1,4 @@
+wal_path = "db/my_wal.log"
+snapshot_path = "db/snapshot.db"
+wal_threshold = 1024
+log_path = "event-db.log"

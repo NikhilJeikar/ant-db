@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tracing_appender::rolling;
 
 pub struct LoggerHandle {
-    pub writer: Arc<tracing_appender::non_blocking::NonBlocking>,
+    pub _writer: Arc<tracing_appender::non_blocking::NonBlocking>,
     pub _guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
@@ -17,7 +17,7 @@ pub fn init_logger(log_file_path: &str) -> LoggerHandle {
         .init();
 
     LoggerHandle {
-        writer: Arc::new(non_blocking),
+        _writer: Arc::new(non_blocking),
         _guard: guard,
     }
 }

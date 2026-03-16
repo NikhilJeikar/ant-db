@@ -7,6 +7,7 @@ use crate::backend::storage::wal::{DataBaseOperation, WALManager, WalOps};
 use rmp_serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
+use tracing::info;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CellStructure {
@@ -21,7 +22,7 @@ pub struct ColumnSchema {
     pub constraints: Vec<Constraint>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnSchema>,
@@ -34,7 +35,7 @@ pub struct InternalCell {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InternalTableSchema {
     pub table_id: u64,
     pub name: String,
@@ -126,7 +127,7 @@ impl WalOps for InternalTableSchema {
             .lock()
             .map_err(|_| DataBaseErrors::WalLockError)?;
         if !self.internal_state_manager.read().unwrap().is_wal_replaying {
-            println!("Writing to WAL {:?}", operation);
+            info!("Writing to WAL {:?}", operation);
             wal.append(&operation);
         }
         Ok(())

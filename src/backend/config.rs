@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::fs;
-
+use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -16,16 +16,67 @@ impl Default for Config {
             wal_path: "wal.log".to_string(),
             snapshot_path: "snapshot.db".to_string(),
             wal_threshold: 1024 * 1024,
-            log_path: "app.log".to_string(),
+            log_path: "app1.log".to_string(),
         }
     }
 }
 
 impl Config {
     pub fn from_file(path: &str) -> Self {
-        match fs::read_to_string(path) {
+        let config = match fs::read_to_string(path) {
             Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-            Err(_) => Config::default(),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to read config file '{}': {}, using default configuration",
+                    path, e
+                );
+                Config::default()
+            }
+        };
+
+        // Create parent directories for log_path, wal_path, and snapshot_path
+        config.ensure_paths_exist();
+        config
+    }
+
+    pub fn ensure_paths_exist(&self) {
+        // Create parent directory for wal_path
+        if let Some(parent) = Path::new(&self.wal_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "Warning: Failed to create WAL directory '{}': {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Create parent directory for snapshot_path
+        if let Some(parent) = Path::new(&self.snapshot_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "Warning: Failed to create snapshot directory '{}': {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Create parent directory for log_path
+        if let Some(parent) = Path::new(&self.log_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "Warning: Failed to create log directory '{}': {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
         }
     }
 }
@@ -44,7 +95,6 @@ impl Default for InternalStateManager {
             is_wal_replaying: false,
         }
     }
-    
 }
 
 impl InternalStateManager {
@@ -54,5 +104,4 @@ impl InternalStateManager {
             is_wal_replaying: false,
         }
     }
-    
 }

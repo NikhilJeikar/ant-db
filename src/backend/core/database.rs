@@ -1,20 +1,21 @@
 use crate::backend::config::InternalStateManager;
-use crate::backend::errors::DataBaseErrors;
-use crate::backend::schema::{
-    Constraint, DataType
+use crate::backend::core::table::{
+    CellStructure, InternalCell, InternalTableSchema, TableManager, TableSchema,
 };
-use crate::backend::core::table::{InternalTableSchema, TableSchema, TableManager, CellStructure, InternalCell};
+use crate::backend::errors::DataBaseErrors;
+use crate::backend::schema::{Constraint, DataType};
 use crate::backend::storage::wal::{DataBaseOperation, WALManager, WalOps};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
+use tracing::info;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DatabaseSchema {
     tables: Vec<TableSchema>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InternalDatabaseSchema {
     pub tables: BTreeMap<u64, InternalTableSchema>,
     #[serde(skip)]
@@ -94,6 +95,22 @@ impl InternalDatabaseSchema {
             wal_manager: wal_manager,
         }
     }
+
+    /// Injects the proper managers into all tables (used after deserialization from snapshot)
+    pub fn inject_contexts(
+        &mut self,
+        internal_state_manager: Arc<RwLock<InternalStateManager>>,
+        wal_manager: Arc<Mutex<WALManager>>,
+    ) {
+        self.internal_state_manager = internal_state_manager;
+        self.wal_manager = wal_manager;
+
+        // Also inject into all tables
+        for table in self.tables.values_mut() {
+            table.internal_state_manager = self.internal_state_manager.clone();
+            table.wal_manager = self.wal_manager.clone();
+        }
+    }
 }
 impl WalOps for InternalDatabaseSchema {
     fn log_operation(&mut self, operation: DataBaseOperation) -> Result<(), DataBaseErrors> {
@@ -102,7 +119,7 @@ impl WalOps for InternalDatabaseSchema {
             .lock()
             .map_err(|_| DataBaseErrors::WalLockError)?;
         if !self.internal_state_manager.read().unwrap().is_wal_replaying {
-            println!("Writing to WAL {:?}", operation);
+            info!("Writing to WAL {:?}", operation);
             wal.append(&operation);
         }
         Ok(())

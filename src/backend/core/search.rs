@@ -11,5 +11,3 @@ struct SearchCriteria {
     operator: SearchOperator,
     value: Vec<u8>,
 }
-
-
