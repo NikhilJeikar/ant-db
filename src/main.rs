@@ -6,8 +6,9 @@ mod backend;
 async fn main() {
     // Initialize database system
     info!("Initializing database system...");
-    let (_internal_state_manager, _wal_manager, db_arc, _snapshot_monitor_shutdown, _logger_handle) = setup();
-    
+    let (_internal_state_manager, _wal_manager, db_arc, _snapshot_monitor_shutdown, _logger_handle) =
+        setup();
+
     info!("Database initialization complete.");
     info!("");
     info!("Starting HTTP API server on http://127.0.0.1:8080");
@@ -39,7 +40,7 @@ async fn main() {
     info!("  curl -X POST http://127.0.0.1:8080/api/tables -H 'Content-Type: application/json' \\");
     info!("       -d '{{\"name\": \"users\"}}'");
     info!("");
-    
+
     // Start the API server
     if let Err(e) = backend::handler::start_api_server(db_arc, "127.0.0.1", 8080).await {
         eprintln!("API server error: {}", e);

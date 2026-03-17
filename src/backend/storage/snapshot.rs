@@ -18,12 +18,12 @@ pub fn write_snapshot(db: &InternalDatabaseSchema, path: &str) -> Result<(), Dat
         DataBaseErrors::SerializationError(e.to_string())
     })?;
     info!("Serialized database to {} bytes", bytes.len());
-    
+
     fs::write(path, bytes).map_err(|e| {
         error!("Failed to write snapshot file {}: {}", path, e);
         DataBaseErrors::IOError(e.to_string())
     })?;
-    
+
     info!("Snapshot successfully written to {}", path);
     Ok(())
 }
@@ -34,13 +34,13 @@ pub fn read_snapshot_with_context(
     wal_manager: Arc<Mutex<WALManager>>,
 ) -> Result<InternalDatabaseSchema, DataBaseErrors> {
     info!("Reading snapshot from {}", path);
-    
+
     let snapshot_bytes = std::fs::read(path).map_err(|e| {
         error!("Failed to read snapshot file {}: {}", path, e);
         DataBaseErrors::IOError(e.to_string())
     })?;
     info!("Snapshot file read: {} bytes", snapshot_bytes.len());
-    
+
     let mut db: InternalDatabaseSchema = from_slice(&snapshot_bytes).map_err(|e| {
         error!("Failed to deserialize snapshot: {}", e);
         DataBaseErrors::SerializationError(e.to_string())
@@ -76,7 +76,7 @@ pub fn start_snapshot_monitor(
                 info!("Shutdown signal received, stopping snapshot monitor");
                 break;
             }
-            
+
             thread::sleep(Duration::from_secs(check_interval_secs));
             debug!("Snapshot monitor check triggered");
 
@@ -87,7 +87,7 @@ pub fn start_snapshot_monitor(
                         let size = wal.get_wal_size();
                         debug!("WAL lock acquired, size: {} bytes", size);
                         size
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire WAL lock for size check: {}", e);
                         continue;
@@ -102,14 +102,14 @@ pub fn start_snapshot_monitor(
                         let thresh = wal.config.wal_threshold as u64;
                         debug!("WAL lock acquired, threshold: {} bytes", thresh);
                         thresh
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to read WAL threshold: {}", e);
                         continue;
                     }
                 }
             };
-            
+
             info!(
                 "Snapshot monitor: WAL size: {} bytes, Threshold: {} bytes",
                 wal_size, threshold
@@ -147,7 +147,7 @@ pub fn start_snapshot_monitor(
                             let path = wal.config.snapshot_path.clone();
                             debug!("Snapshot path retrieved: {}", path);
                             path
-                        },
+                        }
                         Err(e) => {
                             error!("Failed to read snapshot path: {}", e);
                             continue;
@@ -169,10 +169,15 @@ pub fn start_snapshot_monitor(
                                 debug!("WAL lock acquired for file swap");
                                 match std::fs::rename(&temp_path, &snap_path) {
                                     Ok(_) => {
-                                        info!("Snapshot file moved from {} to {}", temp_path, snap_path);
+                                        info!(
+                                            "Snapshot file moved from {} to {}",
+                                            temp_path, snap_path
+                                        );
                                         match wal_guard.clear_wal() {
                                             Ok(_) => {
-                                                info!("Snapshot completed: file moved and WAL cleared");
+                                                info!(
+                                                    "Snapshot completed: file moved and WAL cleared"
+                                                );
                                             }
                                             Err(e) => {
                                                 error!("Failed to clear WAL after snapshot: {}", e);
@@ -180,11 +185,14 @@ pub fn start_snapshot_monitor(
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Failed to move snapshot file from {} to {}: {}", temp_path, snap_path, e);
+                                        error!(
+                                            "Failed to move snapshot file from {} to {}: {}",
+                                            temp_path, snap_path, e
+                                        );
                                         let _ = std::fs::remove_file(&temp_path);
                                     }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 error!("Failed to acquire WAL lock for finalization: {}", e);
                                 let _ = std::fs::remove_file(&temp_path);

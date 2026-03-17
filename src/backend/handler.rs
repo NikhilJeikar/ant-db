@@ -1,13 +1,13 @@
+use actix_web::{App, HttpServer, web};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{error, info};
-use actix_web::{web, App, HttpServer};
 
+use crate::backend::api;
 use crate::backend::config::{Config, InternalStateManager};
 use crate::backend::core::database::InternalDatabaseSchema;
 use crate::backend::logger::{LoggerHandle, init_logger};
 use crate::backend::storage::snapshot::{read_snapshot_with_context, start_snapshot_monitor};
 use crate::backend::storage::wal::{WALManager, replay_wal};
-use crate::backend::api;
 
 pub fn setup() -> (
     Arc<RwLock<InternalStateManager>>,
@@ -96,7 +96,7 @@ pub fn setup() -> (
     let snapshot_monitor_shutdown = start_snapshot_monitor(
         wal_manager.clone(),
         db_arc.clone(),
-        config.wal_sync_interval
+        config.wal_sync_interval,
     );
 
     info!("Snapshot monitor started with 5 second check interval");
@@ -112,10 +112,14 @@ pub fn setup() -> (
 
 /// Start the HTTP API server
 /// This function starts the Actix-web server on the specified address and port
-pub async fn start_api_server(db: Arc<RwLock<InternalDatabaseSchema>>, host: &str, port: u16) -> std::io::Result<()> {
+pub async fn start_api_server(
+    db: Arc<RwLock<InternalDatabaseSchema>>,
+    host: &str,
+    port: u16,
+) -> std::io::Result<()> {
     let address = format!("{}:{}", host, port);
     info!("Starting HTTP API server on {}", address);
-    
+
     let address_clone = address.clone();
 
     HttpServer::new(move || {

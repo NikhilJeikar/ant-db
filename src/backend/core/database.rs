@@ -1,6 +1,6 @@
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::table::{
-    CellStructure, InternalCell, InternalTableSchema, TableManager, TableSchema, TableWriteAheadLog
+    CellStructure, InternalCell, InternalTableSchema, TableManager, TableSchema, TableWriteAheadLog,
 };
 use crate::backend::errors::DataBaseErrors;
 use crate::backend::schema::{Constraint, DataType};
@@ -8,7 +8,7 @@ use crate::backend::storage::wal::{DataBaseOperation, WALManager, WriteAheadLogB
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::{info, debug, error};
+use tracing::{debug, error, info};
 
 fn serialize_tables<S>(
     tables: &BTreeMap<u64, Arc<RwLock<InternalTableSchema>>>,
@@ -19,13 +19,14 @@ where
 {
     let export: BTreeMap<u64, InternalTableSchema> = tables
         .iter()
-        .filter_map(|(k, v)| {
-            match v.read() {
-                Ok(guard) => Some((*k, guard.clone())),
-                Err(e) => {
-                    error!("Failed to acquire read lock on table {} during serialization: {}", k, e);
-                    None
-                }
+        .filter_map(|(k, v)| match v.read() {
+            Ok(guard) => Some((*k, guard.clone())),
+            Err(e) => {
+                error!(
+                    "Failed to acquire read lock on table {} during serialization: {}",
+                    k, e
+                );
+                None
             }
         })
         .collect();
@@ -80,7 +81,7 @@ pub trait DataBaseManager {
     fn drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
     fn create_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
     fn drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
-    
+
     fn insert_rows(
         &mut self,
         table_id: u64,
@@ -115,11 +116,7 @@ pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
         column_id: u64,
         index: BTreeMap<Vec<u8>, u64>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_index(
-        &mut self,
-        table_id: u64,
-        column_id: u64,
-    ) -> Result<(), DataBaseErrors>;
+    fn wal_drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
         &mut self,
         table_id: u64,
@@ -144,10 +141,13 @@ impl WriteAheadLogBase for InternalDatabaseSchema {
                     wal.append(&operation);
                     info!("Operation logged to WAL successfully");
                 } else {
-                    debug!("Skipping WAL log during replay for operation: {:?}", operation);
+                    debug!(
+                        "Skipping WAL log during replay for operation: {:?}",
+                        operation
+                    );
                 }
                 Ok(())
-            },
+            }
             Err(e) => {
                 error!("Failed to acquire WAL lock: {}", e);
                 Err(DataBaseErrors::WalLockError)
@@ -185,8 +185,11 @@ impl InternalDatabaseSchema {
                         self.internal_state_manager.clone(),
                         self.wal_manager.clone(),
                     );
-                },
-                Err(e) => error!("Failed to acquire write lock on table during context injection: {}", e),
+                }
+                Err(e) => error!(
+                    "Failed to acquire write lock on table during context injection: {}",
+                    e
+                ),
             }
         }
     }
@@ -269,11 +272,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_drop_index(
-        &mut self,
-        table_id: u64,
-        column_id: u64,
-    ) -> Result<(), DataBaseErrors> {
+    fn wal_drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_drop_index(column_id),
@@ -339,7 +338,10 @@ impl DataBaseManager for InternalDatabaseSchema {
                 self.wal_manager.clone(),
             ),
         );
-        info!("Table '{}' created successfully with ID {}", table_name, table_id);
+        info!(
+            "Table '{}' created successfully with ID {}",
+            table_name, table_id
+        );
         Ok(table_id)
     }
 
@@ -412,24 +414,28 @@ impl DataBaseManager for InternalDatabaseSchema {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
                 debug!("Acquiring write lock for table {}", table_id);
                 match i.write() {
                     Ok(mut guard) => {
-                        let result = guard.create_column(column_name.clone(), data_type, constraints);
+                        let result =
+                            guard.create_column(column_name.clone(), data_type, constraints);
                         match &result {
-                            Ok(col_id) => info!("Column '{}' created with ID {} in table {}", column_name, col_id, table_id),
+                            Ok(col_id) => info!(
+                                "Column '{}' created with ID {} in table {}",
+                                column_name, col_id, table_id
+                            ),
                             Err(e) => error!("Failed to create column '{}': {}", column_name, e),
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
@@ -439,7 +445,7 @@ impl DataBaseManager for InternalDatabaseSchema {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
                 debug!("Acquiring write lock for table {}", table_id);
                 match i.write() {
@@ -450,67 +456,83 @@ impl DataBaseManager for InternalDatabaseSchema {
                             Err(e) => error!("Failed to drop column {}: {}", column_id, e),
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
     fn create_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
-        debug!("Creating index for column {} in table {}", column_id, table_id);
+        debug!(
+            "Creating index for column {} in table {}",
+            column_id, table_id
+        );
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
                 debug!("Acquiring write lock for table {}", table_id);
                 match i.write() {
                     Ok(mut guard) => {
                         let result = guard.create_index(column_id);
                         match &result {
-                            Ok(_) => info!("Index created for column {} in table {}", column_id, table_id),
-                            Err(e) => error!("Failed to create index for column {}: {}", column_id, e),
+                            Ok(_) => info!(
+                                "Index created for column {} in table {}",
+                                column_id, table_id
+                            ),
+                            Err(e) => {
+                                error!("Failed to create index for column {}: {}", column_id, e)
+                            }
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
     fn drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
-        debug!("Dropping index for column {} in table {}", column_id, table_id);
+        debug!(
+            "Dropping index for column {} in table {}",
+            column_id, table_id
+        );
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
                 debug!("Acquiring write lock for table {}", table_id);
                 match i.write() {
                     Ok(mut guard) => {
                         let result = guard.drop_index(column_id);
                         match &result {
-                            Ok(_) => info!("Index dropped for column {} in table {}", column_id, table_id),
-                            Err(e) => error!("Failed to drop index for column {}: {}", column_id, e),
+                            Ok(_) => info!(
+                                "Index dropped for column {} in table {}",
+                                column_id, table_id
+                            ),
+                            Err(e) => {
+                                error!("Failed to drop index for column {}: {}", column_id, e)
+                            }
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
@@ -525,52 +547,73 @@ impl DataBaseManager for InternalDatabaseSchema {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
-                debug!("Acquiring write lock for table {} to insert {} rows", table_id, row_count);
+                debug!(
+                    "Acquiring write lock for table {} to insert {} rows",
+                    table_id, row_count
+                );
                 match i.write() {
                     Ok(mut guard) => {
                         let result = guard.insert_rows(rows);
                         match &result {
-                            Ok(_) => info!("Successfully inserted {} rows into table {}", row_count, table_id),
-                            Err(e) => error!("Failed to insert {} rows into table {}: {}", row_count, table_id, e),
+                            Ok(_) => info!(
+                                "Successfully inserted {} rows into table {}",
+                                row_count, table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to insert {} rows into table {}: {}",
+                                row_count, table_id, e
+                            ),
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
     fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u64>) -> Result<(), DataBaseErrors> {
         let row_count = row_ids.len();
-        debug!("Deleting {} rows from table {}: {:?}", row_count, table_id, row_ids);
+        debug!(
+            "Deleting {} rows from table {}: {:?}",
+            row_count, table_id, row_ids
+        );
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
-                debug!("Acquiring write lock for table {} to delete {} rows", table_id, row_count);
+                debug!(
+                    "Acquiring write lock for table {} to delete {} rows",
+                    table_id, row_count
+                );
                 match i.write() {
                     Ok(mut guard) => {
                         let result = guard.delete_rows(row_ids);
                         match &result {
-                            Ok(_) => info!("Successfully deleted {} rows from table {}", row_count, table_id),
-                            Err(e) => error!("Failed to delete {} rows from table {}: {}", row_count, table_id, e),
+                            Ok(_) => info!(
+                                "Successfully deleted {} rows from table {}",
+                                row_count, table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to delete {} rows from table {}: {}",
+                                row_count, table_id, e
+                            ),
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
@@ -581,29 +624,41 @@ impl DataBaseManager for InternalDatabaseSchema {
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors> {
         let row_count = row_ids.len();
-        debug!("Updating {} rows in table {}: {:?}", row_count, table_id, row_ids);
+        debug!(
+            "Updating {} rows in table {}: {:?}",
+            row_count, table_id, row_ids
+        );
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
-                debug!("Acquiring write lock for table {} to update {} rows", table_id, row_count);
+                debug!(
+                    "Acquiring write lock for table {} to update {} rows",
+                    table_id, row_count
+                );
                 match i.write() {
                     Ok(mut guard) => {
                         let result = guard.update_rows(row_ids, new_values);
                         match &result {
-                            Ok(_) => info!("Successfully updated {} rows in table {}", row_count, table_id),
-                            Err(e) => error!("Failed to update {} rows in table {}: {}", row_count, table_id, e),
+                            Ok(_) => info!(
+                                "Successfully updated {} rows in table {}",
+                                row_count, table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to update {} rows in table {}: {}",
+                                row_count, table_id, e
+                            ),
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 
@@ -613,24 +668,35 @@ impl DataBaseManager for InternalDatabaseSchema {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
-            },
+            }
             Some(i) => {
-                debug!("Acquiring read lock for table {} to fetch row {}", table_id, row_id);
+                debug!(
+                    "Acquiring read lock for table {} to fetch row {}",
+                    table_id, row_id
+                );
                 match i.read() {
                     Ok(guard) => {
                         let result = guard.get_row(row_id);
                         match &result {
-                            Ok(row) => debug!("Row {} retrieved from table {} with {} cells", row_id, table_id, row.len()),
-                            Err(e) => error!("Failed to fetch row {} from table {}: {}", row_id, table_id, e),
+                            Ok(row) => debug!(
+                                "Row {} retrieved from table {} with {} cells",
+                                row_id,
+                                table_id,
+                                row.len()
+                            ),
+                            Err(e) => error!(
+                                "Failed to fetch row {} from table {}: {}",
+                                row_id, table_id, e
+                            ),
                         }
                         result
-                    },
+                    }
                     Err(e) => {
                         error!("Failed to acquire read lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
                 }
-            },
+            }
         }
     }
 }

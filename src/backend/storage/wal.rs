@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::backend::config::Config;
-use crate::backend::core::database::{InternalDatabaseSchema, DataBaseWriteAheadLog};
+use crate::backend::core::database::{DataBaseWriteAheadLog, InternalDatabaseSchema};
 use crate::backend::core::table::InternalCell;
 use crate::backend::schema::{Constraint, DataType};
 use bincode::deserialize_from;
@@ -100,7 +100,8 @@ impl WALManager {
         bincode::serialize_into(&mut self.writer, op)
             .map_err(|e| debug!("Failed to serialize operation: {}", e))
             .ok();
-        self.writer.flush()
+        self.writer
+            .flush()
             .map_err(|e| debug!("Failed to flush WAL: {}", e))
             .ok();
     }
@@ -111,7 +112,7 @@ impl WALManager {
                 let size = metadata.len();
                 debug!("WAL size: {} bytes", size);
                 size
-            },
+            }
             Err(e) => {
                 error!("Failed to get WAL metadata: {}", e);
                 0
@@ -121,13 +122,10 @@ impl WALManager {
 
     pub fn clear_wal(&mut self) -> Result<(), DataBaseErrors> {
         info!("Clearing WAL file");
-        self.writer
-            .get_ref()
-            .set_len(0)
-            .map_err(|e| {
-                error!("Failed to clear WAL: {}", e);
-                DataBaseErrors::IOError(e.to_string())
-            })?;
+        self.writer.get_ref().set_len(0).map_err(|e| {
+            error!("Failed to clear WAL: {}", e);
+            DataBaseErrors::IOError(e.to_string())
+        })?;
         info!("WAL file cleared successfully");
         Ok(())
     }
@@ -143,17 +141,15 @@ fn apply_operation(
 ) -> Result<(), DataBaseErrors> {
     match op {
         DataBaseOperation::CreateTable { table_id, name } => {
-            db.wal_create_table(table_id, name)
-                .map_err(|e| {
-                    error!("Failed to apply CreateTable operation: {}", e);
-                    e
-                })?
-        }
-        DataBaseOperation::DropTable { table_id } => db.wal_drop_table(table_id)
-            .map_err(|e| {
-                error!("Failed to apply DropTable operation: {}", e);
+            db.wal_create_table(table_id, name).map_err(|e| {
+                error!("Failed to apply CreateTable operation: {}", e);
                 e
-            })?,
+            })?
+        }
+        DataBaseOperation::DropTable { table_id } => db.wal_drop_table(table_id).map_err(|e| {
+            error!("Failed to apply DropTable operation: {}", e);
+            e
+        })?,
         DataBaseOperation::CreateColumn {
             table_id,
             column_id,
@@ -161,26 +157,25 @@ fn apply_operation(
             data_type,
             constraints,
             index,
-        } => {
-            db.wal_create_column(table_id, column_id, name, data_type, constraints, index)
-                .map_err(|e| {
-                    error!("Failed to apply CreateColumn operation: {}", e);
-                    e
-                })?
-        }
+        } => db
+            .wal_create_column(table_id, column_id, name, data_type, constraints, index)
+            .map_err(|e| {
+                error!("Failed to apply CreateColumn operation: {}", e);
+                e
+            })?,
         DataBaseOperation::DropColumn {
             table_id,
             column_id,
-        } => db.wal_drop_column(table_id, column_id)
-            .map_err(|e| {
-                error!("Failed to apply DropColumn operation: {}", e);
-                e
-            })?,
+        } => db.wal_drop_column(table_id, column_id).map_err(|e| {
+            error!("Failed to apply DropColumn operation: {}", e);
+            e
+        })?,
         DataBaseOperation::CreateIndex {
             table_id,
             column_id,
             index,
-        } => db.wal_create_index(table_id, column_id, index)
+        } => db
+            .wal_create_index(table_id, column_id, index)
             .map_err(|e| {
                 error!("Failed to apply CreateIndex operation: {}", e);
                 e
@@ -188,36 +183,32 @@ fn apply_operation(
         DataBaseOperation::DropIndex {
             table_id,
             column_id,
-        } => db.wal_drop_index(table_id, column_id)
-            .map_err(|e| {
-                error!("Failed to apply DropIndex operation: {}", e);
-                e
-            })?,
+        } => db.wal_drop_index(table_id, column_id).map_err(|e| {
+            error!("Failed to apply DropIndex operation: {}", e);
+            e
+        })?,
         DataBaseOperation::InsertRow {
             table_id,
             row_id,
             row,
-        } => db.wal_insert_row(table_id, row_id, row)
-            .map_err(|e| {
-                error!("Failed to apply InsertRow operation: {}", e);
-                e
-            })?,
+        } => db.wal_insert_row(table_id, row_id, row).map_err(|e| {
+            error!("Failed to apply InsertRow operation: {}", e);
+            e
+        })?,
         DataBaseOperation::DeleteRow { table_id, row_id } => {
-            db.wal_delete_row(table_id, row_id)
-                .map_err(|e| {
-                    error!("Failed to apply DeleteRow operation: {}", e);
-                    e
-                })?
+            db.wal_delete_row(table_id, row_id).map_err(|e| {
+                error!("Failed to apply DeleteRow operation: {}", e);
+                e
+            })?
         }
         DataBaseOperation::UpdateRow {
             table_id,
             row_id,
             cells,
-        } => db.wal_update_row(table_id, row_id, cells)
-            .map_err(|e| {
-                error!("Failed to apply UpdateRow operation: {}", e);
-                e
-            })?,
+        } => db.wal_update_row(table_id, row_id, cells).map_err(|e| {
+            error!("Failed to apply UpdateRow operation: {}", e);
+            e
+        })?,
     };
     Ok(())
 }
@@ -249,7 +240,10 @@ pub fn replay_wal(db: &mut InternalDatabaseSchema, wal_path: &str) -> Result<(),
                     }
                 }
                 error!("Failed to read operation from WAL: {}", e);
-                return Err(DataBaseErrors::WalReplayError(format!("WAL replay failed due to read error: {}", e)));
+                return Err(DataBaseErrors::WalReplayError(format!(
+                    "WAL replay failed due to read error: {}",
+                    e
+                )));
             }
         }
     }
