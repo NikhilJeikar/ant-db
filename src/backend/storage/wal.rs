@@ -94,7 +94,6 @@ impl WALManager {
         self.writer.flush()
             .map_err(|e| debug!("Failed to flush WAL: {}", e))
             .ok();
-        debug!("Operation successfully written to WAL");
     }
 
     pub fn get_wal_size(&self) -> u64 {

@@ -144,6 +144,67 @@ impl InternalTableSchema {
         return None;
     }
 
+    fn validate_data_type(data: &DecodedData, expected_type: &DataType) -> bool {
+        match (data, expected_type) {
+            (DecodedData::IntegerU8(_), DataType::IntegerU8) => true,
+            (DecodedData::IntegerU16(_), DataType::IntegerU16) => true,
+            (DecodedData::IntegerU32(_), DataType::IntegerU32) => true,
+            (DecodedData::IntegerU64(_), DataType::IntegerU64) => true,
+            (DecodedData::IntegerU128(_), DataType::IntegerU128) => true,
+            (DecodedData::IntegerI8(_), DataType::IntegerI8) => true,
+            (DecodedData::IntegerI16(_), DataType::IntegerI16) => true,
+            (DecodedData::IntegerI32(_), DataType::IntegerI32) => true,
+            (DecodedData::IntegerI64(_), DataType::IntegerI64) => true,
+            (DecodedData::IntegerI128(_), DataType::IntegerI128) => true,
+            (DecodedData::FloatF32(_), DataType::FloatF32) => true,
+            (DecodedData::FloatF64(_), DataType::FloatF64) => true,
+            (DecodedData::String(_), DataType::String) => true,
+            (DecodedData::Boolean(_), DataType::Boolean) => true,
+            (DecodedData::Bytes(_), DataType::Bytes) => true,
+            _ => false,
+        }
+    }
+
+    fn get_data_type_name(data: &DecodedData) -> &'static str {
+        match data {
+            DecodedData::IntegerU8(_) => "IntegerU8",
+            DecodedData::IntegerU16(_) => "IntegerU16",
+            DecodedData::IntegerU32(_) => "IntegerU32",
+            DecodedData::IntegerU64(_) => "IntegerU64",
+            DecodedData::IntegerU128(_) => "IntegerU128",
+            DecodedData::IntegerI8(_) => "IntegerI8",
+            DecodedData::IntegerI16(_) => "IntegerI16",
+            DecodedData::IntegerI32(_) => "IntegerI32",
+            DecodedData::IntegerI64(_) => "IntegerI64",
+            DecodedData::IntegerI128(_) => "IntegerI128",
+            DecodedData::FloatF32(_) => "FloatF32",
+            DecodedData::FloatF64(_) => "FloatF64",
+            DecodedData::String(_) => "String",
+            DecodedData::Boolean(_) => "Boolean",
+            DecodedData::Bytes(_) => "Bytes",
+        }
+    }
+
+    fn get_expected_type_name(data_type: &DataType) -> &'static str {
+        match data_type {
+            DataType::IntegerU8 => "IntegerU8",
+            DataType::IntegerU16 => "IntegerU16",
+            DataType::IntegerU32 => "IntegerU32",
+            DataType::IntegerU64 => "IntegerU64",
+            DataType::IntegerU128 => "IntegerU128",
+            DataType::IntegerI8 => "IntegerI8",
+            DataType::IntegerI16 => "IntegerI16",
+            DataType::IntegerI32 => "IntegerI32",
+            DataType::IntegerI64 => "IntegerI64",
+            DataType::IntegerI128 => "IntegerI128",
+            DataType::FloatF32 => "FloatF32",
+            DataType::FloatF64 => "FloatF64",
+            DataType::String => "String",
+            DataType::Boolean => "Boolean",
+            DataType::Bytes => "Bytes",
+        }
+    }
+
     fn internal_insert_column(&mut self, column_id: u64, column_schema: ColumnSchema) {
         self.columns.insert(column_id, column_schema);
     }
@@ -323,6 +384,21 @@ impl TableManager for InternalTableSchema {
             let row_id = self.next_row_id;
             self.next_row_id += 1;
 
+            // Validate data types for all cells in the row
+            for v in row.iter() {
+                let column = self.columns.get(&v.column_id)
+                    .ok_or(DataBaseErrors::ColumnNotFound(v.column_id))?;
+                
+                if !Self::validate_data_type(&v.data, &column.data_type) {
+                    return Err(DataBaseErrors::DataTypeMismatch(
+                        v.column_id,
+                        Self::get_expected_type_name(&column.data_type).to_string(),
+                        Self::get_data_type_name(&v.data).to_string(),
+                    ));
+                }
+            }
+
+            // Encode cells after validation
             for v in row.iter() {
                 cells.push(InternalCell {
                     column_id: v.column_id,
@@ -372,6 +448,20 @@ impl TableManager for InternalTableSchema {
         for row_id in &row_ids {
             if !self.rows.iter().any(|r| *r.0 == *row_id) {
                 return Err(DataBaseErrors::RowNotFound(*row_id));
+            }
+        }
+
+        // Validate data types for all cells
+        for cell in new_values.iter() {
+            let column = self.columns.get(&cell.column_id)
+                .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
+            
+            if !Self::validate_data_type(&cell.data, &column.data_type) {
+                return Err(DataBaseErrors::DataTypeMismatch(
+                    cell.column_id,
+                    Self::get_expected_type_name(&column.data_type).to_string(),
+                    Self::get_data_type_name(&cell.data).to_string(),
+                ));
             }
         }
 
