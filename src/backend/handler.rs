@@ -96,7 +96,7 @@ pub fn setup() -> (
     let snapshot_monitor_shutdown = start_snapshot_monitor(
         wal_manager.clone(),
         db_arc.clone(),
-        5, // Check every 5 seconds (configurable)
+        config.wal_sync_interval
     );
 
     info!("Snapshot monitor started with 5 second check interval");

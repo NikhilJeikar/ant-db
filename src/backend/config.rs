@@ -4,10 +4,11 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub wal_path: String,
-    pub snapshot_path: String,
-    pub wal_threshold: usize,
     pub log_path: String,
+    pub snapshot_path: String,
+    pub wal_path: String,
+    pub wal_threshold: usize,
+    pub wal_sync_interval: u64,
 }
 
 impl Default for Config {
@@ -17,6 +18,7 @@ impl Default for Config {
             snapshot_path: "snapshot.db".to_string(),
             wal_threshold: 1024 * 1024,
             log_path: "app1.log".to_string(),
+            wal_sync_interval: 60,
         }
     }
 }
