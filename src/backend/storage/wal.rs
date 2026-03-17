@@ -48,6 +48,10 @@ pub enum DataBaseOperation {
         row_id: u64,
         row: Vec<InternalCell>,
     },
+    BulkInsert {
+        table_id: u64,
+        rows: Vec<(u64, Vec<InternalCell>)>,
+    },
     DeleteRow {
         table_id: u64,
         row_id: u64,
@@ -195,6 +199,12 @@ fn apply_operation(
             error!("Failed to apply InsertRow operation: {}", e);
             e
         })?,
+        DataBaseOperation::BulkInsert { table_id, rows } => {
+            db.wal_bulk_insert(table_id, rows).map_err(|e| {
+                error!("Failed to apply BulkInsert operation: {}", e);
+                e
+            })?
+        }
         DataBaseOperation::DeleteRow { table_id, row_id } => {
             db.wal_delete_row(table_id, row_id).map_err(|e| {
                 error!("Failed to apply DeleteRow operation: {}", e);

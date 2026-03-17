@@ -131,6 +131,11 @@ pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
         row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors>;
+    fn wal_bulk_insert(
+        &mut self,
+        table_id: u64,
+        rows: Vec<(u64, Vec<InternalCell>)>,
+    ) -> Result<(), DataBaseErrors> ;
     fn wal_delete_row(&mut self, table_id: u64, row_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_update_row(
         &mut self,
@@ -298,6 +303,17 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
             Some(i) => i.write().unwrap().wal_insert_row(row_id, row),
         }
     }
+    fn wal_bulk_insert(
+        &mut self,
+        table_id: u64,
+        rows: Vec<(u64, Vec<InternalCell>)>,
+    ) -> Result<(), DataBaseErrors> {
+        match self.tables.get(&table_id) {
+            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
+            Some(i) => i.write().unwrap().wal_bulk_insert(rows),
+        }
+    }
+
 
     fn wal_delete_row(&mut self, table_id: u64, row_id: u64) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
@@ -561,9 +577,22 @@ impl DataBaseManager for InternalDatabaseSchema {
                     "Acquiring write lock for table {} to insert {} rows",
                     table_id, row_count
                 );
-                match i.write() {
+
+                let start_row_id = match i.write() {
                     Ok(mut guard) => {
-                        let result = guard.insert_rows(rows);
+                        let start_row_id = guard.next_row_id;
+                        guard.next_row_id = guard.next_row_id + row_count as u64;
+                        Ok(start_row_id)
+                    }
+                    Err(e) => {
+                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
+                        Err(DataBaseErrors::WalLockError)
+                    }
+                };
+
+                let proccessed_row = match i.read() {
+                    Ok(guard) => {
+                        let result = guard.pre_insert_rows(&rows, start_row_id?);
                         match &result {
                             Ok(_) => info!(
                                 "Successfully inserted {} rows into table {}",
@@ -575,6 +604,16 @@ impl DataBaseManager for InternalDatabaseSchema {
                             ),
                         }
                         result
+                    }
+                    Err(e) => {
+                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
+                        Err(DataBaseErrors::WalLockError)
+                    }
+                };
+                match i.write() {
+                    Ok(mut guard) => {
+                        guard.insert_rows(proccessed_row?);
+                        Ok(())
                     }
                     Err(e) => {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
