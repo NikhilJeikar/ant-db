@@ -125,6 +125,7 @@ pub async fn start_api_server(
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(db.clone()))
+            .app_data(web::JsonConfig::default().limit(20_000_000_000))
             .configure(api::configure_routes)
     })
     .bind(&address_clone)?
