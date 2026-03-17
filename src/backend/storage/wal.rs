@@ -28,9 +28,18 @@ pub enum DataBaseOperation {
         name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: Option<BTreeMap<Vec<u8>, u64>>,
     },
     DropColumn {
+        table_id: u64,
+        column_id: u64,
+    },
+    CreateIndex {
+        table_id: u64,
+        column_id: u64,
+        index: BTreeMap<Vec<u8>, u64>,
+    },
+    DropIndex {
         table_id: u64,
         column_id: u64,
     },
@@ -165,6 +174,23 @@ fn apply_operation(
         } => db.wal_drop_column(table_id, column_id)
             .map_err(|e| {
                 error!("Failed to apply DropColumn operation: {}", e);
+                e
+            })?,
+        DataBaseOperation::CreateIndex {
+            table_id,
+            column_id,
+            index,
+        } => db.wal_create_index(table_id, column_id, index)
+            .map_err(|e| {
+                error!("Failed to apply CreateIndex operation: {}", e);
+                e
+            })?,
+        DataBaseOperation::DropIndex {
+            table_id,
+            column_id,
+        } => db.wal_drop_index(table_id, column_id)
+            .map_err(|e| {
+                error!("Failed to apply DropIndex operation: {}", e);
                 e
             })?,
         DataBaseOperation::InsertRow {

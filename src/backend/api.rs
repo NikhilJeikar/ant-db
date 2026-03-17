@@ -91,6 +91,20 @@ pub struct ErrorResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateIndexResponse {
+    pub table_id: u64,
+    pub column_id: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DropIndexResponse {
+    pub table_id: u64,
+    pub column_id: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GetRowResponse {
     pub table_id: u64,
     pub row_id: u64,
@@ -368,6 +382,60 @@ pub async fn drop_column(
     }
 }
 
+/// Create an index for a column in a table
+/// POST /api/tables/{table_id}/columns/{column_id}/index
+pub async fn create_index(
+    db: web::Data<Database>,
+    path: web::Path<(u64, u64)>,
+) -> impl Responder {
+    let (table_id, column_id) = path.into_inner();
+    debug!("API: Creating index for column {} in table {}", column_id, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.create_index(table_id, column_id) {
+                Ok(_) => {
+                    info!("API: Index created for column {} in table {}", column_id, table_id);
+                    HttpResponse::Created().json(CreateIndexResponse {
+                        table_id,
+                        column_id,
+                        message: format!("Index created successfully for column {}", column_id),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+/// Drop an index for a column in a table
+/// DELETE /api/tables/{table_id}/columns/{column_id}/index
+pub async fn drop_index(
+    db: web::Data<Database>,
+    path: web::Path<(u64, u64)>,
+) -> impl Responder {
+    let (table_id, column_id) = path.into_inner();
+    debug!("API: Dropping index for column {} in table {}", column_id, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.drop_index(table_id, column_id) {
+                Ok(_) => {
+                    info!("API: Index dropped for column {} in table {}", column_id, table_id);
+                    HttpResponse::Ok().json(DropIndexResponse {
+                        table_id,
+                        column_id,
+                        message: format!("Index dropped successfully for column {}", column_id),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
 // ==================== Row Endpoints ====================
 
 /// Insert rows into a table
@@ -523,6 +591,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         // Column operations
         .route("/api/tables/{table_id}/columns", web::post().to(create_column))
         .route("/api/tables/{table_id}/columns/{column_id}", web::delete().to(drop_column))
+        .route("/api/tables/{table_id}/columns/{column_id}/index", web::post().to(create_index))
+        .route("/api/tables/{table_id}/columns/{column_id}/index", web::delete().to(drop_index))
         
         // Row operations
         .route("/api/tables/{table_id}/rows", web::post().to(insert_rows))

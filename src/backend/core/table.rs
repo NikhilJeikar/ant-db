@@ -20,7 +20,7 @@ pub struct ColumnSchema {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<Constraint>,
-    pub index: BTreeMap<Vec<u8>, u64>,
+    pub index: Option<BTreeMap<Vec<u8>, u64>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -59,6 +59,9 @@ pub trait TableManager {
         constraints: Vec<Constraint>,
     ) -> Result<u64, DataBaseErrors>;
     fn drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
+    
+    fn create_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
 
     fn insert_rows(&mut self, rows: Vec<Vec<CellStructure>>) -> Result<(), DataBaseErrors>;
     fn delete_rows(&mut self, row_ids: Vec<u64>) -> Result<(), DataBaseErrors>;
@@ -81,9 +84,15 @@ pub trait TableWriteAheadLog: WriteAheadLogBase {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: Option<BTreeMap<Vec<u8>, u64>>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn wal_create_index(
+        &mut self,
+        column_id: u64,
+        index: BTreeMap<Vec<u8>, u64>,
+    ) -> Result<(), DataBaseErrors>;
+    fn wal_drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
         &mut self,
         row_id: u64,
@@ -205,6 +214,12 @@ impl InternalTableSchema {
         }
     }
 
+    fn should_create_index(constraints: &Vec<Constraint>) -> bool {
+        constraints.iter().any(|c| {
+            matches!(c, Constraint::Unique | Constraint::PrimaryKey)
+        })
+    }
+
     fn internal_insert_column(&mut self, column_id: u64, column_schema: ColumnSchema) {
         self.columns.insert(column_id, column_schema);
     }
@@ -217,6 +232,37 @@ impl InternalTableSchema {
                 row.remove(pos);
             }
         }
+    }
+
+    fn build_index_for_column(&self, column_id: u64) -> Result<BTreeMap<Vec<u8>, u64>, DataBaseErrors> {
+        if !self.columns.contains_key(&column_id) {
+            return Err(DataBaseErrors::ColumnNotFound(column_id));
+        }
+
+        let mut new_index = BTreeMap::new();
+
+        for (row_id, cells) in self.rows.iter() {
+            if let Some(cell) = cells.iter().find(|c| c.column_id == column_id) {
+                new_index.insert(cell.data.clone(), *row_id);
+            }
+        }
+
+        info!("Built index for column {} with {} entries", column_id, new_index.len());
+        Ok(new_index)
+    }
+
+    fn apply_index_to_column(&mut self, column_id: u64, index: BTreeMap<Vec<u8>, u64>) -> Result<(), DataBaseErrors> {
+        let column = self.columns.get_mut(&column_id)
+            .ok_or(DataBaseErrors::ColumnNotFound(column_id))?;
+
+        if column.index.is_some() {
+            info!("Index already exists for column {}", column_id);
+            return Ok(());
+        }
+
+        column.index = Some(index);
+        info!("Applied index to column {}", column_id);
+        Ok(())
     }
 
     fn internal_insert_row(
@@ -235,7 +281,9 @@ impl InternalTableSchema {
                 None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
             };
 
-            column.index.insert(cell.data.clone(), row_id_u64);
+            if let Some(ref mut index) = column.index {
+                index.insert(cell.data.clone(), row_id_u64);
+            }
         }
 
         self.rows.insert(row_id_u64, row);
@@ -256,7 +304,9 @@ impl InternalTableSchema {
                 .get_mut(&cell.column_id)
                 .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
 
-            column.index.remove(&cell.data);
+            if let Some(ref mut index) = column.index {
+                index.remove(&cell.data);
+            }
         }
 
         self.rows.remove(&row_id);
@@ -284,8 +334,9 @@ impl InternalTableSchema {
                 Some(c) => c,
                 None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
             };
-
-            column.index.remove(&cell.data);
+            if let Some(ref mut index) = column.index {
+                index.remove(&cell.data);
+            }
         }
 
         for cell in &row {
@@ -294,7 +345,9 @@ impl InternalTableSchema {
                 None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
             };
 
-            column.index.insert(cell.data.clone(), row_id);
+            if let Some(ref mut index) = column.index {
+                index.insert(cell.data.clone(), row_id);
+            }
         }
 
         self.rows.insert(row_id, row);
@@ -341,13 +394,22 @@ impl TableManager for InternalTableSchema {
         let column_id = self.next_column_id;
         self.next_column_id += 1;
 
+        // Only create index if column has Unique or PrimaryKey constraint
+        let index = if Self::should_create_index(&constraints) {
+            info!("Creating index for column {} with constraints", column_id);
+            Some(BTreeMap::new())
+        } else {
+            info!("Column {} created without index (no Unique/PrimaryKey constraint)", column_id);
+            None
+        };
+
         self.log_operation(DataBaseOperation::CreateColumn {
             table_id: self.table_id,
             column_id,
             name: column_name.clone(),
             data_type: data_type.clone(),
             constraints: constraints.clone(),
-            index: BTreeMap::new(),
+            index: index.clone(),
         })?;
 
         self.internal_insert_column(
@@ -356,7 +418,7 @@ impl TableManager for InternalTableSchema {
                 name: column_name,
                 data_type,
                 constraints,
-                index: BTreeMap::new(),
+                index,
             },
         );
         Ok(column_id)
@@ -373,6 +435,66 @@ impl TableManager for InternalTableSchema {
         })?;
 
         self.internal_drop_column(column_id);
+
+        Ok(())
+    }
+
+    fn create_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+        // Validate column exists
+        if !self.columns.contains_key(&column_id) {
+            return Err(DataBaseErrors::ColumnNotFound(column_id));
+        }
+
+        // Check if index already exists
+        let column = self.columns.get(&column_id)
+            .ok_or(DataBaseErrors::ColumnNotFound(column_id))?;
+
+        if column.index.is_some() {
+            info!("Index already exists for column {}", column_id);
+            return Ok(());
+        }
+
+        // Build the index WITHOUT modifying database state
+        let index = self.build_index_for_column(column_id)?;
+
+        // Log the operation to WAL FIRST
+        self.log_operation(DataBaseOperation::CreateIndex {
+            table_id: self.table_id,
+            column_id,
+            index: index.clone(),
+        })?;
+
+        // Apply the index to the column AFTER logging
+        self.apply_index_to_column(column_id, index)?;
+
+        Ok(())
+    }
+
+    fn drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+        // Validate column exists
+        if !self.columns.contains_key(&column_id) {
+            return Err(DataBaseErrors::ColumnNotFound(column_id));
+        }
+
+        // Check if index exists
+        let column = self.columns.get(&column_id)
+            .ok_or(DataBaseErrors::ColumnNotFound(column_id))?;
+
+        if column.index.is_none() {
+            return Err(DataBaseErrors::IndexNotFound(column_id));
+        }
+
+        // Log the operation to WAL BEFORE modifying state
+        self.log_operation(DataBaseOperation::DropIndex {
+            table_id: self.table_id,
+            column_id,
+        })?;
+
+        // Remove the index after logging
+        let column = self.columns.get_mut(&column_id)
+            .ok_or(DataBaseErrors::ColumnNotFound(column_id))?;
+        column.index = None;
+        info!("Index dropped for column {}", column_id);
 
         Ok(())
     }
@@ -527,11 +649,27 @@ impl TableWriteAheadLog for InternalTableSchema {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: Option<BTreeMap<Vec<u8>, u64>>,
     ) -> Result<(), DataBaseErrors> {
         if self.columns.iter().any(|c| c.1.name == column_name) {
             return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
         }
+
+        // During WAL replay, also apply the constraint-based index logic for consistency
+        let final_index = if Self::should_create_index(&constraints) {
+            // If constraints require an index, use the provided index or create empty one
+            if let Some(existing_index) = index {
+                info!("WAL replay: Restoring index for column {} with constraints", column_id);
+                Some(existing_index)
+            } else {
+                info!("WAL replay: Creating empty index for column {} with constraints", column_id);
+                Some(BTreeMap::new())
+            }
+        } else {
+            // If constraints don't require an index, discard any index from WAL
+            info!("WAL replay: Column {} created without index (no Unique/PrimaryKey constraint)", column_id);
+            None
+        };
 
         self.internal_insert_column(
             column_id,
@@ -539,7 +677,7 @@ impl TableWriteAheadLog for InternalTableSchema {
                 name: column_name,
                 data_type,
                 constraints,
-                index,
+                index: final_index,
             },
         );
         Ok(())
@@ -551,6 +689,36 @@ impl TableWriteAheadLog for InternalTableSchema {
 
         self.internal_drop_column(column_id);
 
+        Ok(())
+    }
+    fn wal_create_index(
+        &mut self,
+        column_id: u64,
+        index: BTreeMap<Vec<u8>, u64>,
+    ) -> Result<(), DataBaseErrors> {
+        let column = self.columns.get_mut(&column_id)
+            .ok_or(DataBaseErrors::ColumnNotFound(column_id))?;
+
+        if column.index.is_some() {
+            info!("WAL replay: Index already exists for column {}", column_id);
+            return Ok(());
+        }
+
+        column.index = Some(index);
+        info!("WAL replay: Index restored for column {}", column_id);
+        Ok(())
+    }
+    fn wal_drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+        let column = self.columns.get_mut(&column_id)
+            .ok_or(DataBaseErrors::ColumnNotFound(column_id))?;
+
+        if column.index.is_none() {
+            info!("WAL replay: Index does not exist for column {}", column_id);
+            return Ok(());
+        }
+
+        column.index = None;
+        info!("WAL replay: Index dropped for column {}", column_id);
         Ok(())
     }
     fn wal_insert_row(

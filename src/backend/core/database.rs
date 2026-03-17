@@ -78,6 +78,9 @@ pub trait DataBaseManager {
         constraints: Vec<Constraint>,
     ) -> Result<u64, DataBaseErrors>;
     fn drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn create_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
+    
     fn insert_rows(
         &mut self,
         table_id: u64,
@@ -103,9 +106,20 @@ pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: Option<BTreeMap<Vec<u8>, u64>>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn wal_create_index(
+        &mut self,
+        table_id: u64,
+        column_id: u64,
+        index: BTreeMap<Vec<u8>, u64>,
+    ) -> Result<(), DataBaseErrors>;
+    fn wal_drop_index(
+        &mut self,
+        table_id: u64,
+        column_id: u64,
+    ) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
         &mut self,
         table_id: u64,
@@ -166,10 +180,12 @@ impl InternalDatabaseSchema {
         // Also inject into all tables
         for table in self.tables.values_mut() {
             match table.write() {
-                Ok(mut guard) => guard.inject_contexts(
-                    self.internal_state_manager.clone(),
-                    self.wal_manager.clone(),
-                ),
+                Ok(mut guard) => {
+                    guard.inject_contexts(
+                        self.internal_state_manager.clone(),
+                        self.wal_manager.clone(),
+                    );
+                },
                 Err(e) => error!("Failed to acquire write lock on table during context injection: {}", e),
             }
         }
@@ -220,7 +236,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         column_name: String,
         data_type: crate::backend::schema::DataType,
         constraints: Vec<crate::backend::schema::Constraint>,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: Option<BTreeMap<Vec<u8>, u64>>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -238,6 +254,29 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_drop_column(column_id),
+        }
+    }
+
+    fn wal_create_index(
+        &mut self,
+        table_id: u64,
+        column_id: u64,
+        index: BTreeMap<Vec<u8>, u64>,
+    ) -> Result<(), DataBaseErrors> {
+        match self.tables.get(&table_id) {
+            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
+            Some(i) => i.write().unwrap().wal_create_index(column_id, index),
+        }
+    }
+
+    fn wal_drop_index(
+        &mut self,
+        table_id: u64,
+        column_id: u64,
+    ) -> Result<(), DataBaseErrors> {
+        match self.tables.get(&table_id) {
+            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
+            Some(i) => i.write().unwrap().wal_drop_index(column_id),
         }
     }
 
@@ -409,6 +448,60 @@ impl DataBaseManager for InternalDatabaseSchema {
                         match &result {
                             Ok(_) => info!("Column {} dropped from table {}", column_id, table_id),
                             Err(e) => error!("Failed to drop column {}: {}", column_id, e),
+                        }
+                        result
+                    },
+                    Err(e) => {
+                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
+                        Err(DataBaseErrors::WalLockError)
+                    }
+                }
+            },
+        }
+    }
+
+    fn create_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+        debug!("Creating index for column {} in table {}", column_id, table_id);
+        match self.tables.get(&table_id) {
+            None => {
+                error!("Table not found: {}", table_id);
+                Err(DataBaseErrors::TableIDNotFound(table_id))
+            },
+            Some(i) => {
+                debug!("Acquiring write lock for table {}", table_id);
+                match i.write() {
+                    Ok(mut guard) => {
+                        let result = guard.create_index(column_id);
+                        match &result {
+                            Ok(_) => info!("Index created for column {} in table {}", column_id, table_id),
+                            Err(e) => error!("Failed to create index for column {}: {}", column_id, e),
+                        }
+                        result
+                    },
+                    Err(e) => {
+                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
+                        Err(DataBaseErrors::WalLockError)
+                    }
+                }
+            },
+        }
+    }
+
+    fn drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+        debug!("Dropping index for column {} in table {}", column_id, table_id);
+        match self.tables.get(&table_id) {
+            None => {
+                error!("Table not found: {}", table_id);
+                Err(DataBaseErrors::TableIDNotFound(table_id))
+            },
+            Some(i) => {
+                debug!("Acquiring write lock for table {}", table_id);
+                match i.write() {
+                    Ok(mut guard) => {
+                        let result = guard.drop_index(column_id);
+                        match &result {
+                            Ok(_) => info!("Index dropped for column {} in table {}", column_id, table_id),
+                            Err(e) => error!("Failed to drop index for column {}: {}", column_id, e),
                         }
                         result
                     },

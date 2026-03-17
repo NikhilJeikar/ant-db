@@ -7,6 +7,8 @@ pub enum DataBaseErrors {
     ColumnAlreadyExists(String),
     #[error("Column '{0}' not found in the table.")]
     ColumnNotFound(u64),
+    #[error("Index not found for column {0}.")]
+    IndexNotFound(u64),
 
     // Row-related errors
     #[error("Row with ID '{0}' not found in the table.")]
