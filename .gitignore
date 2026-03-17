@@ -2,3 +2,5 @@
 *.log
 *.wal
 *.db
+
+test/*

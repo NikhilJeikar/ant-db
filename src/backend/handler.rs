@@ -7,18 +7,18 @@ use crate::backend::config::{Config, InternalStateManager};
 use crate::backend::core::database::InternalDatabaseSchema;
 use crate::backend::logger::{LoggerHandle, init_logger};
 use crate::backend::storage::snapshot::{read_snapshot_with_context, start_snapshot_monitor};
-use crate::backend::storage::wal::{WALManager, replay_wal};
+use crate::backend::storage::wal::{WriteAheadLogManager, replay_wal};
 
 pub fn setup() -> (
     Arc<RwLock<InternalStateManager>>,
-    Arc<Mutex<WALManager>>,
+    Arc<Mutex<WriteAheadLogManager>>,
     Arc<RwLock<InternalDatabaseSchema>>,
     Arc<std::sync::atomic::AtomicBool>,
     LoggerHandle,
 ) {
     let config = Config::from_file("db_config.toml");
     let internal_state_manager = Arc::new(RwLock::new(InternalStateManager::new(config.clone())));
-    let wal_manager = Arc::new(Mutex::new(WALManager::new(
+    let wal_manager = Arc::new(Mutex::new(WriteAheadLogManager::new(
         internal_state_manager.read().unwrap().config.clone(),
     )));
     let logger_handle = init_logger(

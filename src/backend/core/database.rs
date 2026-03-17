@@ -1,10 +1,11 @@
 use crate::backend::config::InternalStateManager;
+use crate::backend::core::search::{Projection, SearchCriteria, SortBy};
 use crate::backend::core::table::{
     CellStructure, InternalCell, InternalTableSchema, TableManager, TableSchema, TableWriteAheadLog,
 };
 use crate::backend::errors::DataBaseErrors;
 use crate::backend::schema::{Constraint, DataType};
-use crate::backend::storage::wal::{DataBaseOperation, WALManager, WriteAheadLogBase};
+use crate::backend::storage::wal::{DataBaseOperation, WriteAheadLogBase, WriteAheadLogManager};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -58,7 +59,7 @@ pub struct InternalDatabaseSchema {
     #[serde(skip)]
     pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
     #[serde(skip)]
-    pub wal_manager: Arc<Mutex<WALManager>>,
+    pub wal_manager: Arc<Mutex<WriteAheadLogManager>>,
 }
 
 pub trait DataBaseManager {
@@ -95,6 +96,13 @@ pub trait DataBaseManager {
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors>;
     fn get_row(&self, table_id: u64, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors>;
+    fn search_rows(
+        &self,
+        table_id: u64,
+        criteria: Vec<SearchCriteria>,
+        projection: Option<Projection>,
+        sort_by: Option<SortBy>,
+    ) -> Result<Vec<Vec<CellStructure>>, DataBaseErrors>;
 }
 
 pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
@@ -107,14 +115,14 @@ pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: Option<BTreeMap<Vec<u8>, u64>>,
+        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_create_index(
         &mut self,
         table_id: u64,
         column_id: u64,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: BTreeMap<Vec<u8>, Vec<u64>>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
@@ -158,7 +166,7 @@ impl WriteAheadLogBase for InternalDatabaseSchema {
 impl InternalDatabaseSchema {
     pub fn new(
         internal_state_manager: Arc<RwLock<InternalStateManager>>,
-        wal_manager: Arc<Mutex<WALManager>>,
+        wal_manager: Arc<Mutex<WriteAheadLogManager>>,
     ) -> Self {
         InternalDatabaseSchema {
             tables: BTreeMap::new(),
@@ -172,7 +180,7 @@ impl InternalDatabaseSchema {
     pub fn inject_contexts(
         &mut self,
         internal_state_manager: Arc<RwLock<InternalStateManager>>,
-        wal_manager: Arc<Mutex<WALManager>>,
+        wal_manager: Arc<Mutex<WriteAheadLogManager>>,
     ) {
         self.internal_state_manager = internal_state_manager;
         self.wal_manager = wal_manager;
@@ -239,7 +247,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         column_name: String,
         data_type: crate::backend::schema::DataType,
         constraints: Vec<crate::backend::schema::Constraint>,
-        index: Option<BTreeMap<Vec<u8>, u64>>,
+        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -264,7 +272,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         &mut self,
         table_id: u64,
         column_id: u64,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: BTreeMap<Vec<u8>, Vec<u64>>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -688,6 +696,47 @@ impl DataBaseManager for InternalDatabaseSchema {
                                 "Failed to fetch row {} from table {}: {}",
                                 row_id, table_id, e
                             ),
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        error!("Failed to acquire read lock for table {}: {}", table_id, e);
+                        Err(DataBaseErrors::WalLockError)
+                    }
+                }
+            }
+        }
+    }
+
+    fn search_rows(
+        &self,
+        table_id: u64,
+        criteria: Vec<SearchCriteria>,
+        projection: Option<Projection>,
+        sort_by: Option<SortBy>,
+    ) -> Result<Vec<Vec<CellStructure>>, DataBaseErrors> {
+        debug!(
+            "Searching table {} with {} criteria, projection: {}, sort_by: {}",
+            table_id,
+            criteria.len(),
+            projection.is_some(),
+            sort_by.is_some()
+        );
+        match self.tables.get(&table_id) {
+            None => {
+                error!("Table not found: {}", table_id);
+                Err(DataBaseErrors::TableIDNotFound(table_id))
+            }
+            Some(i) => {
+                debug!("Acquiring read lock for table {} to search", table_id);
+                match i.read() {
+                    Ok(guard) => {
+                        let result = guard.find_row(criteria, projection, sort_by);
+                        match &result {
+                            Ok(rows) => {
+                                info!("Search in table {} returned {} rows", table_id, rows.len())
+                            }
+                            Err(e) => error!("Failed to search table {}: {}", table_id, e),
                         }
                         result
                     }

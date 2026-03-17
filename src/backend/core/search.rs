@@ -1,4 +1,9 @@
-enum SearchOperator {
+use serde::{Deserialize, Serialize};
+
+use crate::backend::schema::DecodedData;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum SearchOperator {
     Equal,
     NotEqual,
     GreaterThan,
@@ -6,8 +11,24 @@ enum SearchOperator {
     GreaterThanOrEqual,
     LessThanOrEqual,
 }
-struct SearchCriteria {
-    column_id: u64,
-    operator: SearchOperator,
-    value: Vec<u8>,
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum OrderBy {
+    ASC,
+    DESC,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchCriteria {
+    pub column_id: u64,
+    pub operator: SearchOperator,
+    pub value: DecodedData,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SortBy {
+    pub column_id: u64,
+    pub order_by: OrderBy,
+}
+
+pub type Projection = Vec<u64>;

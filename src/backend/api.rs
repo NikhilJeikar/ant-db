@@ -1,4 +1,5 @@
 use crate::backend::core::database::{DataBaseManager, InternalDatabaseSchema};
+use crate::backend::core::search::{Projection, SearchCriteria, SortBy};
 use crate::backend::core::table::CellStructure;
 use crate::backend::errors::DataBaseErrors;
 use crate::backend::schema::{Constraint, DataType};
@@ -124,6 +125,21 @@ pub struct SchemaResponse {
     pub table_id: u64,
     pub table_name: String,
     pub columns: Vec<ColumnSchemaResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchRowsRequest {
+    pub criteria: Vec<SearchCriteria>,
+    pub projection: Option<Projection>,
+    pub sort_by: Option<SortBy>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchRowsResponse {
+    pub table_id: u64,
+    pub row_count: usize,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub message: String,
 }
 
 // ==================== Helper Functions ====================
@@ -542,6 +558,59 @@ pub async fn update_rows(
     }
 }
 
+/// Search rows in a table with optional projection and sorting
+/// POST /api/tables/{table_id}/search
+pub async fn search_rows(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+    req: web::Json<SearchRowsRequest>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    debug!(
+        "API: Searching table {} with {} criteria",
+        table_id,
+        req.criteria.len()
+    );
+
+    match db.read() {
+        Ok(db_guard) => {
+            match db_guard.search_rows(
+                table_id,
+                req.criteria.clone(),
+                req.projection.clone(),
+                req.sort_by.clone(),
+            ) {
+                Ok(rows) => {
+                    let row_count = rows.len();
+                    info!(
+                        "API: Search in table {} returned {} rows",
+                        table_id, row_count
+                    );
+
+                    // Convert CellStructure to JSON-safe format
+                    let json_rows: Vec<Vec<serde_json::Value>> = rows
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .filter_map(|cell| serde_json::to_value(cell).ok())
+                                .collect()
+                        })
+                        .collect();
+
+                    HttpResponse::Ok().json(SearchRowsResponse {
+                        table_id,
+                        row_count,
+                        rows: json_rows,
+                        message: format!("Found {} matching rows", row_count),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_read_lock_error(e),
+    }
+}
+
 // ==================== Health Check ====================
 
 /// Health check endpoint
@@ -596,5 +665,6 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/api/tables/{table_id}/rows/{row_id}",
             web::get().to(get_row),
-        );
+        )
+        .route("/api/tables/{table_id}/search", web::post().to(search_rows));
 }

@@ -1,7 +1,7 @@
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::database::InternalDatabaseSchema;
 use crate::backend::errors::DataBaseErrors;
-use crate::backend::storage::wal::WALManager;
+use crate::backend::storage::wal::WriteAheadLogManager;
 use rmp_serde::from_slice;
 use rmp_serde::to_vec;
 use std::fs;
@@ -31,7 +31,7 @@ pub fn write_snapshot(db: &InternalDatabaseSchema, path: &str) -> Result<(), Dat
 pub fn read_snapshot_with_context(
     path: &str,
     internal_state_manager: Arc<RwLock<InternalStateManager>>,
-    wal_manager: Arc<Mutex<WALManager>>,
+    wal_manager: Arc<Mutex<WriteAheadLogManager>>,
 ) -> Result<InternalDatabaseSchema, DataBaseErrors> {
     info!("Reading snapshot from {}", path);
 
@@ -58,7 +58,7 @@ pub fn read_snapshot_with_context(
 /// Starts a background thread that monitors WAL size and triggers snapshots when threshold is exceeded.
 /// Returns a shutdown flag that can be used to stop the monitor thread.
 pub fn start_snapshot_monitor(
-    wal_manager: Arc<std::sync::Mutex<WALManager>>,
+    wal_manager: Arc<std::sync::Mutex<WriteAheadLogManager>>,
     db: Arc<std::sync::RwLock<InternalDatabaseSchema>>,
     check_interval_secs: u64,
 ) -> Arc<AtomicBool> {

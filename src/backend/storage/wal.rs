@@ -28,7 +28,7 @@ pub enum DataBaseOperation {
         name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: Option<BTreeMap<Vec<u8>, u64>>,
+        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
     },
     DropColumn {
         table_id: u64,
@@ -37,7 +37,7 @@ pub enum DataBaseOperation {
     CreateIndex {
         table_id: u64,
         column_id: u64,
-        index: BTreeMap<Vec<u8>, u64>,
+        index: BTreeMap<Vec<u8>, Vec<u64>>,
     },
     DropIndex {
         table_id: u64,
@@ -60,12 +60,12 @@ pub enum DataBaseOperation {
 }
 
 #[derive(Debug)]
-pub struct WALManager {
+pub struct WriteAheadLogManager {
     pub config: Config,
     writer: BufWriter<std::fs::File>,
 }
 
-impl Default for WALManager {
+impl Default for WriteAheadLogManager {
     fn default() -> Self {
         let file = OpenOptions::new()
             .create(true)
@@ -80,7 +80,7 @@ impl Default for WALManager {
     }
 }
 
-impl WALManager {
+impl WriteAheadLogManager {
     pub fn new(config: Config) -> Self {
         info!("Initializing WAL Manager with path: {}", config.wal_path);
         let file = OpenOptions::new()

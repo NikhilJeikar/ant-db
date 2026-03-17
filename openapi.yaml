@@ -297,6 +297,89 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/tables/{table_id}/columns/{column_id}/index:
+    post:
+      tags:
+        - Columns
+      summary: Create an index
+      description: Create an index on a column for faster lookups. Automatically created for columns with Unique or PrimaryKey constraints.
+      operationId: createIndex
+      parameters:
+        - name: table_id
+          in: path
+          required: true
+          description: Table ID
+          schema:
+            type: integer
+            format: uint32
+        - name: column_id
+          in: path
+          required: true
+          description: Column ID
+          schema:
+            type: integer
+            format: uint32
+      responses:
+        '201':
+          description: Index created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateIndexResponse'
+        '500':
+          description: Failed to create index
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags:
+        - Columns
+      summary: Drop an index
+      description: Remove an index from a column
+      operationId: dropIndex
+      parameters:
+        - name: table_id
+          in: path
+          required: true
+          description: Table ID
+          schema:
+            type: integer
+            format: uint32
+        - name: column_id
+          in: path
+          required: true
+          description: Column ID
+          schema:
+            type: integer
+            format: uint32
+      responses:
+        '200':
+          description: Index dropped successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DropIndexResponse'
+        '500':
+          description: Failed to drop index
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/tables/{table_id}/rows:
     post:
       tags:
@@ -461,6 +544,53 @@ paths:
                 $ref: '#/components/schemas/GetRowResponse'
         '404':
           description: Row not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/tables/{table_id}/search:
+    post:
+      tags:
+        - Rows
+      summary: Search rows
+      description: Search and filter rows with optional projection and sorting. Allows complex queries with multiple search criteria, column selection (projection), and result ordering.
+      operationId: searchRows
+      parameters:
+        - name: table_id
+          in: path
+          required: true
+          description: Table ID
+          schema:
+            type: integer
+            format: uint32
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRowsRequest'
+      responses:
+        '200':
+          description: Search completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchRowsResponse'
+        '400':
+          description: Invalid search criteria
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Failed to execute search
           content:
             application/json:
               schema:
@@ -696,10 +826,122 @@ components:
         row_id:
           type: integer
           format: uint64
+        table_id:
+          type: integer
+          format: uint32
         cells:
           type: array
           items:
             $ref: '#/components/schemas/CellData'
+
+    CreateIndexResponse:
+      type: object
+      properties:
+        table_id:
+          type: integer
+          format: uint32
+        column_id:
+          type: integer
+          format: uint32
+        message:
+          type: string
+          example: "Index created successfully for column 1"
+
+    DropIndexResponse:
+      type: object
+      properties:
+        table_id:
+          type: integer
+          format: uint32
+        column_id:
+          type: integer
+          format: uint32
+        message:
+          type: string
+          example: "Index dropped successfully for column 1"
+
+    SearchCriteria:
+      type: object
+      required:
+        - column_id
+        - operator
+        - value
+      properties:
+        column_id:
+          type: integer
+          format: uint32
+          description: Column ID to search on
+        operator:
+          type: string
+          enum:
+            - Equal
+            - NotEqual
+            - GreaterThan
+            - LessThan
+            - GreaterThanOrEqual
+            - LessThanOrEqual
+          description: Comparison operator
+        value:
+          type: string
+          description: Value to compare (encoded as bytes)
+
+    SortBy:
+      type: object
+      required:
+        - column_id
+        - order_by
+      properties:
+        column_id:
+          type: integer
+          format: uint32
+          description: Column ID to sort by
+        order_by:
+          type: string
+          enum:
+            - ASC
+            - DESC
+          description: Sort order
+
+    SearchRowsRequest:
+      type: object
+      required:
+        - criteria
+      properties:
+        criteria:
+          type: array
+          description: Array of search criteria to filter rows
+          items:
+            $ref: '#/components/schemas/SearchCriteria'
+        projection:
+          type: array
+          description: Optional column IDs to return. If omitted, all columns are returned.
+          items:
+            type: integer
+            format: uint32
+          example: [1, 2]
+        sort_by:
+          description: Optional sorting configuration
+          $ref: '#/components/schemas/SortBy'
+
+    SearchRowsResponse:
+      type: object
+      properties:
+        table_id:
+          type: integer
+          format: uint32
+        row_count:
+          type: integer
+          format: uint32
+          description: Number of rows returned
+        rows:
+          type: array
+          description: Array of matching rows
+          items:
+            type: array
+            items: {}
+        message:
+          type: string
+          example: "Found 5 matching rows"
 
     ErrorResponse:
       type: object
