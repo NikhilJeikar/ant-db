@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::backend::config::InternalStateManager;
 use crate::backend::errors::DataBaseErrors;
 use crate::backend::schema::{Constraint, DataType, DecodedData};
-use crate::backend::storage::wal::{DataBaseOperation, WALManager, WalOps};
+use crate::backend::storage::wal::{DataBaseOperation, WALManager, WriteAheadLogBase};
 use rmp_serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
-use tracing::info;
+use tracing::{info, error};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CellStructure {
@@ -20,6 +20,7 @@ pub struct ColumnSchema {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<Constraint>,
+    pub index: BTreeMap<Vec<u8>, u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -42,6 +43,7 @@ pub struct InternalTableSchema {
     pub columns: BTreeMap<u64, ColumnSchema>,
     pub rows: BTreeMap<u128, Vec<InternalCell>>,
     pub next_row_id: u128,
+    pub next_column_id: u64,
 
     #[serde(skip)]
     pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
@@ -55,8 +57,9 @@ pub trait TableManager {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-    ) -> Result<(), DataBaseErrors>;
+    ) -> Result<u64, DataBaseErrors>;
     fn drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
+
     fn insert_rows(&mut self, rows: Vec<Vec<CellStructure>>) -> Result<(), DataBaseErrors>;
     fn delete_rows(&mut self, row_ids: Vec<u128>) -> Result<(), DataBaseErrors>;
     fn update_rows(
@@ -65,9 +68,12 @@ pub trait TableManager {
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors>;
 
+    fn get_row(&self, row_id: u128) -> Result<Vec<CellStructure>, DataBaseErrors>;
+
     fn get_size(&self) -> usize;
     fn get_schema(&self) -> Result<TableSchema, DataBaseErrors>;
-
+}
+pub trait TableWriteAheadLog: WriteAheadLogBase {
     // replay operations for WAL recovery
     fn wal_create_column(
         &mut self,
@@ -75,6 +81,7 @@ pub trait TableManager {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
+        index: BTreeMap<Vec<u8>, u128>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
@@ -88,9 +95,6 @@ pub trait TableManager {
         row_id: u128,
         cells: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors>;
-
-    // temporary method for testing this should be replaced with a more flexible update method that can update specific columns in the future
-    fn get_row(&self, row_id: u128) -> Result<Vec<CellStructure>, DataBaseErrors>;
 }
 
 impl InternalTableSchema {
@@ -106,9 +110,19 @@ impl InternalTableSchema {
             columns: BTreeMap::new(),
             rows: BTreeMap::new(),
             next_row_id: 1,
+            next_column_id: 1,
             internal_state_manager,
             wal_manager,
         }
+    }
+
+    pub fn inject_contexts(
+        &mut self,
+        internal_state_manager: Arc<RwLock<InternalStateManager>>,
+        wal_manager: Arc<Mutex<WALManager>>,
+    ) {
+        self.internal_state_manager = internal_state_manager;
+        self.wal_manager = wal_manager;
     }
 
     fn encode_cell(value: &DecodedData) -> Result<Vec<u8>, DataBaseErrors> {
@@ -118,15 +132,131 @@ impl InternalTableSchema {
     fn decode_cell(bytes: &[u8]) -> Result<DecodedData, DataBaseErrors> {
         from_slice(bytes).map_err(|e| DataBaseErrors::DeserializationError(e.to_string()))
     }
+
+    fn duplicate_cells(cells: &Vec<InternalCell>) -> Option<u64> {
+        let mut present_columns:HashSet<u64> = HashSet::new();
+        for cell in cells {
+            if present_columns.contains(&cell.column_id) {
+                return Some(cell.column_id);
+            }
+            present_columns.insert(cell.column_id);
+        }
+        return None;
+    }
+
+    fn internal_insert_column(&mut self, column_id: u64, column_schema: ColumnSchema) {
+        self.columns.insert(column_id, column_schema);
+    }
+
+    fn internal_drop_column(&mut self, column_id: u64) {
+        self.columns.remove(&column_id);
+
+        for row in self.rows.values_mut() {
+            if let Some(pos) = row.iter().position(|c| c.column_id == column_id) {
+                row.remove(pos);
+            }
+        }
+    }
+
+    fn internal_insert_row(
+        &mut self,
+        row_id: u128,
+        row: Vec<InternalCell>,
+    ) -> Result<(), DataBaseErrors> {
+        if let Some(col) = Self::duplicate_cells(&row) {
+            return Err(DataBaseErrors::RowColumnDuplicate(row_id, col));
+        }
+
+        for cell in &row {
+            let column = match self.columns.get_mut(&cell.column_id) {
+                Some(c) => c,
+                None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
+            };
+
+            column.index.insert(cell.data.clone(), row_id);
+        }
+
+        self.rows.insert(row_id, row);
+
+        Ok(())
+    }
+
+    fn internal_delete_row(&mut self, row_id: u128) -> Result<(), DataBaseErrors> {
+        let row = self
+            .rows
+            .remove(&row_id)
+            .ok_or(DataBaseErrors::RowNotFound(row_id))?;
+
+        for cell in &row {
+            let column = self
+                .columns
+                .get_mut(&cell.column_id)
+                .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
+
+            column.index.remove(&cell.data);
+        }
+
+        self.rows.remove(&row_id);
+
+        Ok(())
+    }
+
+    fn internal_update_row(
+        &mut self,
+        row_id: u128,
+        row: Vec<InternalCell>,
+    ) -> Result<(), DataBaseErrors> {
+        if let Some(col) = Self::duplicate_cells(&row) {
+            return Err(DataBaseErrors::RowColumnDuplicate(row_id, col));
+        }
+
+        let prev_row = self
+            .rows
+            .get(&row_id)
+            .ok_or(DataBaseErrors::RowNotFound(row_id))?
+            .clone();
+
+        for cell in &prev_row {
+            let column = match self.columns.get_mut(&cell.column_id) {
+                Some(c) => c,
+                None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
+            };
+
+            column.index.remove(&cell.data);
+        }
+
+        for cell in &row {
+            let column = match self.columns.get_mut(&cell.column_id) {
+                Some(c) => c,
+                None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
+            };
+
+            column.index.insert(cell.data.clone(), row_id);
+        }
+
+        self.rows.insert(row_id, row);
+
+        Ok(())
+    }
 }
 
-impl WalOps for InternalTableSchema {
+impl WriteAheadLogBase for InternalTableSchema {
     fn log_operation(&mut self, operation: DataBaseOperation) -> Result<(), DataBaseErrors> {
         let mut wal = self
             .wal_manager
             .lock()
-            .map_err(|_| DataBaseErrors::WalLockError)?;
-        if !self.internal_state_manager.read().unwrap().is_wal_replaying {
+            .map_err(|e| {
+                error!("Failed to acquire WAL lock: {}", e);
+                DataBaseErrors::WalLockError
+            })?;
+        
+        let is_replaying = self
+            .internal_state_manager
+            .read()
+            .map(|guard| guard.is_wal_replaying)
+            .unwrap_or(false);
+        
+        if !is_replaying {
             info!("Writing to WAL {:?}", operation);
             wal.append(&operation);
         }
@@ -140,44 +270,46 @@ impl TableManager for InternalTableSchema {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-    ) -> Result<(), DataBaseErrors> {
+    ) -> Result<u64, DataBaseErrors> {
         if self.columns.iter().any(|c| c.1.name == column_name) {
             return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
         }
-        let column_id = self.columns.len() as u64 + 1;
+
+        let column_id = self.next_column_id;
+        self.next_column_id += 1;
+
         self.log_operation(DataBaseOperation::CreateColumn {
             table_id: self.table_id,
             column_id,
             name: column_name.clone(),
             data_type: data_type.clone(),
             constraints: constraints.clone(),
+            index: BTreeMap::new(),
         })?;
-        self.columns.insert(
+
+        self.internal_insert_column(
             column_id,
             ColumnSchema {
                 name: column_name,
                 data_type,
                 constraints,
+                index: BTreeMap::new(),
             },
         );
-        Ok(())
+        Ok(column_id)
     }
 
     fn drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
         if !self.columns.contains_key(&column_id) {
-            return Err(DataBaseErrors::ColumnNotFound(column_id.to_string()));
+            return Err(DataBaseErrors::ColumnNotFound(column_id));
         }
+
         self.log_operation(DataBaseOperation::DropColumn {
             table_id: self.table_id,
             column_id,
         })?;
-        self.columns.remove(&column_id);
 
-        for row in self.rows.values_mut() {
-            if let Some(pos) = row.iter().position(|c| c.column_id == column_id) {
-                row.remove(pos);
-            }
-        }
+        self.internal_drop_column(column_id);
 
         Ok(())
     }
@@ -185,8 +317,10 @@ impl TableManager for InternalTableSchema {
     fn insert_rows(&mut self, rows: Vec<Vec<CellStructure>>) -> Result<(), DataBaseErrors> {
         for row in rows {
             let mut cells = Vec::with_capacity(row.len());
+
             let row_id = self.next_row_id;
             self.next_row_id += 1;
+
             for v in row.iter() {
                 cells.push(InternalCell {
                     column_id: v.column_id,
@@ -199,7 +333,11 @@ impl TableManager for InternalTableSchema {
                 row_id,
                 row: cells.clone(),
             })?;
-            self.rows.insert(row_id, cells);
+
+            let _ = match self.internal_insert_row(row_id, cells) {
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            };
         }
         Ok(())
     }
@@ -215,7 +353,11 @@ impl TableManager for InternalTableSchema {
                 table_id: self.table_id,
                 row_id: *row_id,
             })?;
-            self.rows.remove(row_id);
+
+            let _ = match self.internal_delete_row(*row_id) {
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            };
         }
         Ok(())
     }
@@ -233,10 +375,10 @@ impl TableManager for InternalTableSchema {
 
         let mut cells = Vec::with_capacity(new_values.len());
 
-        for v in new_values.iter() {
+        for cell in new_values.iter() {
             cells.push(InternalCell {
-                column_id: v.column_id,
-                data: Self::encode_cell(&v.data)?,
+                column_id: cell.column_id,
+                data: Self::encode_cell(&cell.data)?,
             });
         }
 
@@ -246,9 +388,11 @@ impl TableManager for InternalTableSchema {
                 row_id: *row_id,
                 cells: cells.clone(),
             })?;
-            if let Some(row) = self.rows.get_mut(row_id) {
-                *row = cells.clone();
-            }
+
+            let _ = match self.internal_update_row(*row_id, cells.clone()) {
+                Ok(_) => continue,
+                Err(e) => return Err(e),
+            };
         }
         Ok(())
     }
@@ -261,12 +405,14 @@ impl TableManager for InternalTableSchema {
             .ok_or(DataBaseErrors::RowNotFound(row_id))?;
 
         let mut decoded_cells = Vec::with_capacity(row.1.len());
+
         for cell in row.1.iter() {
             decoded_cells.push(CellStructure {
                 column_id: cell.column_id,
                 data: Self::decode_cell(&cell.data)?,
             });
         }
+
         Ok(decoded_cells)
     }
 
@@ -280,32 +426,38 @@ impl TableManager for InternalTableSchema {
             columns,
         })
     }
+}
 
+impl TableWriteAheadLog for InternalTableSchema {
     fn wal_create_column(
         &mut self,
         column_id: u64,
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
+        index: BTreeMap<Vec<u8>, u128>,
     ) -> Result<(), DataBaseErrors> {
-        self.columns.insert(
+        if self.columns.iter().any(|c| c.1.name == column_name) {
+            return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
+        }
+
+        self.internal_insert_column(
             column_id,
             ColumnSchema {
                 name: column_name,
                 data_type,
                 constraints,
+                index,
             },
         );
         Ok(())
     }
     fn wal_drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
-        self.columns.remove(&column_id);
-
-        for row in self.rows.values_mut() {
-            if let Some(pos) = row.iter().position(|c| c.column_id == column_id) {
-                row.remove(pos);
-            }
+        if !self.columns.contains_key(&column_id) {
+            return Err(DataBaseErrors::ColumnNotFound(column_id));
         }
+
+        self.internal_drop_column(column_id);
 
         Ok(())
     }
@@ -314,25 +466,19 @@ impl TableManager for InternalTableSchema {
         row_id: u128,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
-        // Update next_row_id to ensure future inserts don't have collisions
         if row_id >= self.next_row_id {
             self.next_row_id = row_id + 1;
         }
-        self.rows.insert(row_id, row);
-        Ok(())
+        self.internal_insert_row(row_id, row)
     }
     fn wal_delete_row(&mut self, row_id: u128) -> Result<(), DataBaseErrors> {
-        self.rows.remove(&row_id);
-        Ok(())
+        self.internal_delete_row(row_id)
     }
     fn wal_update_row(
         &mut self,
         row_id: u128,
         cells: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
-        if let Some(row) = self.rows.get_mut(&row_id) {
-            *row = cells;
-        }
-        Ok(())
+        self.internal_update_row(row_id, cells)
     }
 }

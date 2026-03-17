@@ -1,0 +1,483 @@
+use crate::backend::core::database::{DataBaseManager, InternalDatabaseSchema};
+use crate::backend::core::table::CellStructure;
+use crate::backend::errors::DataBaseErrors;
+use crate::backend::schema::{Constraint, DataType};
+use actix_web::{web, HttpResponse, Responder};
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
+use std::sync::Arc;
+use tracing::{debug, error, info};
+
+// Type alias for database with proper locking
+pub type Database = Arc<RwLock<InternalDatabaseSchema>>;
+
+// ==================== Request/Response Types ====================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateTableRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateTableResponse {
+    pub table_id: u64,
+    pub name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateColumnRequest {
+    pub column_name: String,
+    pub data_type: DataType,
+    #[serde(default)]
+    pub constraints: Vec<Constraint>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreateColumnResponse {
+    pub column_id: u64,
+    pub column_name: String,
+    pub table_id: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InsertRowsRequest {
+    pub rows: Vec<Vec<CellStructure>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InsertRowsResponse {
+    pub row_count: usize,
+    pub table_id: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeleteRowsRequest {
+    pub row_ids: Vec<u128>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeleteRowsResponse {
+    pub deleted_count: usize,
+    pub table_id: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateRowsRequest {
+    pub row_ids: Vec<u128>,
+    pub new_values: Vec<CellStructure>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UpdateRowsResponse {
+    pub updated_count: usize,
+    pub table_id: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ListTablesResponse {
+    pub tables: Vec<String>,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ErrorResponse {
+    pub error: String,
+    pub status: u16,
+}
+
+// ==================== Helper Functions ====================
+
+/// Convert database error to HTTP response
+fn error_to_response(error: DataBaseErrors) -> HttpResponse {
+    error!("Database error: {}", error);
+    HttpResponse::InternalServerError().json(ErrorResponse {
+        error: error.to_string(),
+        status: 500,
+    })
+}
+
+/// Handle lock acquisition errors
+fn handle_lock_error(error: std::sync::PoisonError<std::sync::RwLockWriteGuard<InternalDatabaseSchema>>) -> HttpResponse {
+    error!("Failed to acquire write lock: {}", error);
+    HttpResponse::ServiceUnavailable().json(ErrorResponse {
+        error: "Database lock temporarily unavailable".to_string(),
+        status: 503,
+    })
+}
+
+fn handle_read_lock_error(error: std::sync::PoisonError<std::sync::RwLockReadGuard<InternalDatabaseSchema>>) -> HttpResponse {
+    error!("Failed to acquire read lock: {}", error);
+    HttpResponse::ServiceUnavailable().json(ErrorResponse {
+        error: "Database lock temporarily unavailable".to_string(),
+        status: 503,
+    })
+}
+
+// ==================== Table Endpoints ====================
+
+/// Create a new table
+/// POST /api/tables
+pub async fn create_table(
+    db: web::Data<Database>,
+    req: web::Json<CreateTableRequest>,
+) -> impl Responder {
+    debug!("API: Creating table '{}'", req.name);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.create_table(req.name.clone()) {
+                Ok(table_id) => {
+                    info!("API: Table '{}' created with ID {}", req.name, table_id);
+                    HttpResponse::Created().json(CreateTableResponse {
+                        table_id,
+                        name: req.name.clone(),
+                        message: format!("Table '{}' created successfully", req.name),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+/// Drop a table
+/// DELETE /api/tables/{table_id}
+pub async fn drop_table(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    debug!("API: Dropping table {}", table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.drop_table(table_id) {
+                Ok(_) => {
+                    info!("API: Table {} dropped successfully", table_id);
+                    HttpResponse::Ok().json(serde_json::json!({
+                        "message": format!("Table {} dropped successfully", table_id),
+                        "table_id": table_id
+                    }))
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+/// Get table ID by name
+/// GET /api/tables/by-name/{name}
+pub async fn get_table_id(
+    db: web::Data<Database>,
+    name: web::Path<String>,
+) -> impl Responder {
+    let table_name = name.into_inner();
+    debug!("API: Getting table ID for '{}'", table_name);
+    
+    match db.read() {
+        Ok(db_guard) => {
+            match db_guard.get_table_id(table_name.clone()) {
+                Ok(table_id) => {
+                    info!("API: Table ID {} found for '{}'", table_id, table_name);
+                    HttpResponse::Ok().json(serde_json::json!({
+                        "table_name": table_name,
+                        "table_id": table_id
+                    }))
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_read_lock_error(e),
+    }
+}
+
+/// List all tables
+/// GET /api/tables
+pub async fn list_tables(db: web::Data<Database>) -> impl Responder {
+    debug!("API: Listing all tables");
+    
+    match db.read() {
+        Ok(db_guard) => {
+            let tables = db_guard.list_tables();
+            let count = tables.len();
+            info!("API: Found {} tables", count);
+            HttpResponse::Ok().json(ListTablesResponse { tables, count })
+        }
+        Err(e) => handle_read_lock_error(e),
+    }
+}
+
+/// Get table schema
+/// GET /api/tables/{table_id}/schema
+pub async fn get_table_schema(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    debug!("API: Getting table schema for {}", table_id);
+    
+    match db.read() {
+        Ok(db_guard) => {
+            match db_guard.get_table_schema(table_id) {
+                Ok(schema) => {
+                    info!("API: Schema retrieved for table {}", table_id);
+                    HttpResponse::Ok().json(schema)
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_read_lock_error(e),
+    }
+}
+
+/// Get table size (row count)
+/// GET /api/tables/{table_id}/size
+pub async fn get_table_size(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    debug!("API: Getting table size for {}", table_id);
+    
+    match db.read() {
+        Ok(db_guard) => {
+            match db_guard.get_table_size(table_id) {
+                Ok(size) => {
+                    info!("API: Table {} has {} rows", table_id, size);
+                    HttpResponse::Ok().json(serde_json::json!({
+                        "table_id": table_id,
+                        "row_count": size
+                    }))
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_read_lock_error(e),
+    }
+}
+
+// ==================== Column Endpoints ====================
+
+/// Create a column in a table
+/// POST /api/tables/{table_id}/columns
+pub async fn create_column(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+    req: web::Json<CreateColumnRequest>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    debug!("API: Creating column '{}' in table {}", req.column_name, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.create_column(
+                table_id,
+                req.column_name.clone(),
+                req.data_type.clone(),
+                req.constraints.clone(),
+            ) {
+                Ok(column_id) => {
+                    info!("API: Column {} created in table {}", column_id, table_id);
+                    HttpResponse::Created().json(CreateColumnResponse {
+                        column_id,
+                        column_name: req.column_name.clone(),
+                        table_id,
+                        message: format!("Column '{}' created successfully", req.column_name),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+/// Drop a column from a table
+/// DELETE /api/tables/{table_id}/columns/{column_id}
+pub async fn drop_column(
+    db: web::Data<Database>,
+    path: web::Path<(u64, u64)>,
+) -> impl Responder {
+    let (table_id, column_id) = path.into_inner();
+    debug!("API: Dropping column {} from table {}", column_id, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.drop_column(table_id, column_id) {
+                Ok(_) => {
+                    info!("API: Column {} dropped from table {}", column_id, table_id);
+                    HttpResponse::Ok().json(serde_json::json!({
+                        "message": format!("Column {} dropped successfully", column_id),
+                        "table_id": table_id,
+                        "column_id": column_id
+                    }))
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+// ==================== Row Endpoints ====================
+
+/// Insert rows into a table
+/// POST /api/tables/{table_id}/rows
+pub async fn insert_rows(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+    req: web::Json<InsertRowsRequest>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    let row_count = req.rows.len();
+    debug!("API: Inserting {} rows into table {}", row_count, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.insert_rows(table_id, req.rows.clone()) {
+                Ok(_) => {
+                    info!("API: {} rows inserted into table {}", row_count, table_id);
+                    HttpResponse::Created().json(InsertRowsResponse {
+                        row_count,
+                        table_id,
+                        message: format!("{} rows inserted successfully", row_count),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+/// Get a specific row
+/// GET /api/tables/{table_id}/rows/{row_id}
+pub async fn get_row(
+    db: web::Data<Database>,
+    path: web::Path<(u64, u128)>,
+) -> impl Responder {
+    let (table_id, row_id) = path.into_inner();
+    debug!("API: Getting row {} from table {}", row_id, table_id);
+    
+    match db.read() {
+        Ok(db_guard) => {
+            match db_guard.get_row(table_id, row_id) {
+                Ok(row) => {
+                    info!("API: Row {} retrieved from table {}", row_id, table_id);
+                    HttpResponse::Ok().json(serde_json::json!({
+                        "table_id": table_id,
+                        "row_id": row_id,
+                        "cells": row
+                    }))
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_read_lock_error(e),
+    }
+}
+
+/// Delete rows from a table
+/// DELETE /api/tables/{table_id}/rows
+pub async fn delete_rows(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+    req: web::Json<DeleteRowsRequest>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    let deleted_count = req.row_ids.len();
+    debug!("API: Deleting {} rows from table {}", deleted_count, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.delete_rows(table_id, req.row_ids.clone()) {
+                Ok(_) => {
+                    info!("API: {} rows deleted from table {}", deleted_count, table_id);
+                    HttpResponse::Ok().json(DeleteRowsResponse {
+                        deleted_count,
+                        table_id,
+                        message: format!("{} rows deleted successfully", deleted_count),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+/// Update rows in a table
+/// PUT /api/tables/{table_id}/rows
+pub async fn update_rows(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+    req: web::Json<UpdateRowsRequest>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    let updated_count = req.row_ids.len();
+    debug!("API: Updating {} rows in table {}", updated_count, table_id);
+    
+    match db.write() {
+        Ok(mut db_guard) => {
+            match db_guard.update_rows(table_id, req.row_ids.clone(), req.new_values.clone()) {
+                Ok(_) => {
+                    info!("API: {} rows updated in table {}", updated_count, table_id);
+                    HttpResponse::Ok().json(UpdateRowsResponse {
+                        updated_count,
+                        table_id,
+                        message: format!("{} rows updated successfully", updated_count),
+                    })
+                }
+                Err(e) => error_to_response(e),
+            }
+        }
+        Err(e) => handle_lock_error(e),
+    }
+}
+
+// ==================== Health Check ====================
+
+/// Health check endpoint
+/// GET /api/health
+pub async fn health_check() -> impl Responder {
+    debug!("API: Health check");
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "Database API",
+        "version": "0.1.0"
+    }))
+}
+
+// ==================== API Configuration ====================
+
+/// Configure all API routes
+pub fn configure_routes(cfg: &mut web::ServiceConfig) {
+    cfg
+        // Health check
+        .route("/api/health", web::get().to(health_check))
+        
+        // Table operations
+        .route("/api/tables", web::post().to(create_table))
+        .route("/api/tables", web::get().to(list_tables))
+        .route("/api/tables/by-name/{name}", web::get().to(get_table_id))
+        .route("/api/tables/{table_id}", web::delete().to(drop_table))
+        .route("/api/tables/{table_id}/schema", web::get().to(get_table_schema))
+        .route("/api/tables/{table_id}/size", web::get().to(get_table_size))
+        
+        // Column operations
+        .route("/api/tables/{table_id}/columns", web::post().to(create_column))
+        .route("/api/tables/{table_id}/columns/{column_id}", web::delete().to(drop_column))
+        
+        // Row operations
+        .route("/api/tables/{table_id}/rows", web::post().to(insert_rows))
+        .route("/api/tables/{table_id}/rows", web::delete().to(delete_rows))
+        .route("/api/tables/{table_id}/rows", web::put().to(update_rows))
+        .route("/api/tables/{table_id}/rows/{row_id}", web::get().to(get_row));
+}

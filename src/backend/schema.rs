@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd)]
 pub enum DecodedData {
     IntegerU8(u8),
     IntegerU16(u16),
@@ -38,12 +38,12 @@ pub enum DataType {
     Bytes,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum Constraint {
     NotNull,
     Unique,
     PrimaryKey,
-    ForeignKey(String, String),
+    ForeignKey(String, String), // Referenced table and column
     Check(String),
     AutoIncrement,
 }

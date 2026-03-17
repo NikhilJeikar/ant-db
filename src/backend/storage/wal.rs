@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use crate::backend::config::Config;
-use crate::backend::core::database::{InternalDatabaseSchema, SchemaManager};
+use crate::backend::core::database::{InternalDatabaseSchema, DataBaseWriteAheadLog};
 use crate::backend::core::table::InternalCell;
 use crate::backend::schema::{Constraint, DataType};
 use bincode::deserialize_from;
@@ -26,6 +28,7 @@ pub enum DataBaseOperation {
         name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
+        index: BTreeMap<Vec<u8>, u128>,
     },
     DropColumn {
         table_id: u64,
@@ -70,6 +73,7 @@ impl Default for WALManager {
 
 impl WALManager {
     pub fn new(config: Config) -> Self {
+        info!("Initializing WAL Manager with path: {}", config.wal_path);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -83,24 +87,45 @@ impl WALManager {
     }
 
     pub fn append(&mut self, op: &DataBaseOperation) {
-        bincode::serialize_into(&mut self.writer, op).unwrap();
-        self.writer.flush().unwrap();
+        debug!("Appending operation to WAL: {:?}", op);
+        bincode::serialize_into(&mut self.writer, op)
+            .map_err(|e| debug!("Failed to serialize operation: {}", e))
+            .ok();
+        self.writer.flush()
+            .map_err(|e| debug!("Failed to flush WAL: {}", e))
+            .ok();
+        debug!("Operation successfully written to WAL");
     }
 
     pub fn get_wal_size(&self) -> u64 {
-        self.writer.get_ref().metadata().unwrap().len()
+        match self.writer.get_ref().metadata() {
+            Ok(metadata) => {
+                let size = metadata.len();
+                debug!("WAL size: {} bytes", size);
+                size
+            },
+            Err(e) => {
+                error!("Failed to get WAL metadata: {}", e);
+                0
+            }
+        }
     }
 
     pub fn clear_wal(&mut self) -> Result<(), DataBaseErrors> {
+        info!("Clearing WAL file");
         self.writer
             .get_ref()
             .set_len(0)
-            .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+            .map_err(|e| {
+                error!("Failed to clear WAL: {}", e);
+                DataBaseErrors::IOError(e.to_string())
+            })?;
+        info!("WAL file cleared successfully");
         Ok(())
     }
 }
 
-pub trait WalOps {
+pub trait WriteAheadLogBase {
     fn log_operation(&mut self, operation: DataBaseOperation) -> Result<(), DataBaseErrors>;
 }
 
@@ -110,37 +135,65 @@ fn apply_operation(
 ) -> Result<(), DataBaseErrors> {
     match op {
         DataBaseOperation::CreateTable { table_id, name } => {
-            db.wal_create_table(table_id, name).unwrap();
+            db.wal_create_table(table_id, name)
+                .map_err(|e| {
+                    error!("Failed to apply CreateTable operation: {}", e);
+                    e
+                })?
         }
-        DataBaseOperation::DropTable { table_id } => db.wal_drop_table(table_id).unwrap(),
+        DataBaseOperation::DropTable { table_id } => db.wal_drop_table(table_id)
+            .map_err(|e| {
+                error!("Failed to apply DropTable operation: {}", e);
+                e
+            })?,
         DataBaseOperation::CreateColumn {
             table_id,
             column_id,
             name,
             data_type,
             constraints,
+            index,
         } => {
-            db.wal_create_column(table_id, column_id, name, data_type, constraints)
-                .unwrap();
+            db.wal_create_column(table_id, column_id, name, data_type, constraints, index)
+                .map_err(|e| {
+                    error!("Failed to apply CreateColumn operation: {}", e);
+                    e
+                })?
         }
         DataBaseOperation::DropColumn {
             table_id,
             column_id,
-        } => db.wal_drop_column(table_id, column_id).unwrap(),
+        } => db.wal_drop_column(table_id, column_id)
+            .map_err(|e| {
+                error!("Failed to apply DropColumn operation: {}", e);
+                e
+            })?,
         DataBaseOperation::InsertRow {
             table_id,
             row_id,
             row,
-        } => db.wal_insert_row(table_id, row_id, row).unwrap(),
+        } => db.wal_insert_row(table_id, row_id, row)
+            .map_err(|e| {
+                error!("Failed to apply InsertRow operation: {}", e);
+                e
+            })?,
         DataBaseOperation::DeleteRow { table_id, row_id } => {
-            db.wal_delete_row(table_id, row_id).unwrap()
+            db.wal_delete_row(table_id, row_id)
+                .map_err(|e| {
+                    error!("Failed to apply DeleteRow operation: {}", e);
+                    e
+                })?
         }
         DataBaseOperation::UpdateRow {
             table_id,
             row_id,
             cells,
-        } => db.wal_update_row(table_id, row_id, cells).unwrap(),
-    }
+        } => db.wal_update_row(table_id, row_id, cells)
+            .map_err(|e| {
+                error!("Failed to apply UpdateRow operation: {}", e);
+                e
+            })?,
+    };
     Ok(())
 }
 
@@ -159,7 +212,7 @@ pub fn replay_wal(db: &mut InternalDatabaseSchema, wal_path: &str) -> Result<(),
                     }
                     Err(e) => {
                         error!("Failed to apply operation: {}", e);
-                        panic!("WAL replay failed due to operation application error {e}");
+                        return Err(DataBaseErrors::WalReplayError(e.to_string()));
                     }
                 }
             }
@@ -171,7 +224,7 @@ pub fn replay_wal(db: &mut InternalDatabaseSchema, wal_path: &str) -> Result<(),
                     }
                 }
                 error!("Failed to read operation from WAL: {}", e);
-                panic!("WAL replay failed due to read error {e}");
+                return Err(DataBaseErrors::WalReplayError(format!("WAL replay failed due to read error: {}", e)));
             }
         }
     }

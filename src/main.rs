@@ -1,117 +1,47 @@
-use crate::backend::core::database::SchemaManager;
-use crate::backend::core::table::CellStructure;
 use crate::backend::handler::setup;
-use crate::backend::schema::{DataType, DecodedData};
-use std::io;
 use tracing::info;
 mod backend;
 
-fn main() {
-    // Example usage of the database system
-
-    let (_internal_state_manager, _wal_manager, db_arc, _snapshot_monitor_shutdown, _logger_handle) =
-        setup();
-    let mut db = db_arc.write().unwrap();
-
-    let table_id = match db.create_table("Users".to_string()) {
-        Ok(id) => id,
-        Err(e) => match db.get_table_id("Users".to_string()) {
-            Ok(table_id) => {
-                info!("Table 'Users' already exists with ID: {}", table_id);
-                table_id
-            }
-            Err(_) => {
-                info!("Failed to create or find 'Users' table: {}", e);
-                return;
-            }
-        },
-    };
-
-    {
-        let _ = db.create_column(
-            table_id,
-            "ID".to_string(),
-            DataType::IntegerI128,
-            Vec::new(),
-        );
-        let _ = db.create_column(table_id, "Name".to_string(), DataType::String, Vec::new());
-        let _ = db.create_column(table_id, "Age".to_string(), DataType::IntegerU8, Vec::new());
-        let _ = db.create_column(
-            table_id,
-            "IsActive".to_string(),
-            DataType::Boolean,
-            Vec::new(),
-        );
-
-        for i in 1u32..=10u32 {
-            let _ = db.insert_rows(
-                table_id,
-                vec![vec![
-                    CellStructure {
-                        column_id: 1,
-                        data: DecodedData::IntegerI128(i as i128),
-                    },
-                    CellStructure {
-                        column_id: 2,
-                        data: DecodedData::String(format!("User{}", i)),
-                    },
-                    CellStructure {
-                        column_id: 3,
-                        data: DecodedData::IntegerU8((20 + (i % 30)) as u8),
-                    },
-                    CellStructure {
-                        column_id: 4,
-                        data: DecodedData::Boolean(i % 2 == 0),
-                    },
-                ]],
-            );
-        }
-
-        info!(
-            "Table '{}' has {} rows.",
-            db.get_table_schema(table_id).unwrap().name,
-            db.get_table_size(table_id).unwrap()
-        );
-        // Example: get the row with ID 10 (assuming DecodedData::IntegerI128 exists)
-        let search = db.get_row(table_id, 10);
-        info!("Row with ID 10: {:?}", search);
-        info!(
-            "Table Schema: {:?}",
-            db.get_table_schema(table_id).unwrap().columns
-        );
-        info!(
-            "Dropping entry with ID 10: {:?}",
-            db.delete_rows(table_id, vec![10])
-        );
-        info!(
-            "Row with ID 10 after deletion: {:?}",
-            db.get_row(table_id, 10)
-        );
-        info!(
-            "Table '{}' has {} rows after deletion.",
-            db.get_table_schema(table_id).unwrap().name,
-            db.get_table_size(table_id).unwrap()
-        );
-    }
-
-    info!("All tables in the database: {:?}", db.list_tables());
-    info!(
-        "Table Schema after deletion: {:?}",
-        db.get_table_schema(table_id)
-    );
-    loop {
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read line");
-
-        let row_id = input.trim().parse::<u128>().unwrap_or(0);
-        let search = db.get_row(table_id, row_id);
-        info!("Row with ID {}: {:?}", row_id, search);
-        info!(
-            "Table '{}' has {} rows.",
-            db.get_table_schema(table_id).unwrap().name,
-            db.get_table_size(table_id).unwrap()
-        );
+#[tokio::main]
+async fn main() {
+    // Initialize database system
+    info!("Initializing database system...");
+    let (_internal_state_manager, _wal_manager, db_arc, _snapshot_monitor_shutdown, _logger_handle) = setup();
+    
+    info!("Database initialization complete.");
+    info!("");
+    info!("Starting HTTP API server on http://127.0.0.1:8080");
+    info!("");
+    info!("Available API Endpoints:");
+    info!("═══════════════════════════════════════════════════════════════════════════");
+    info!("HEALTH:");
+    info!("  GET  /api/health");
+    info!("");
+    info!("TABLES:");
+    info!("  POST   /api/tables                     - Create a new table");
+    info!("  GET    /api/tables                     - List all tables");
+    info!("  DELETE /api/tables/{{table_id}}            - Drop a table");
+    info!("  GET    /api/tables/{{table_id}}/schema     - Get table schema");
+    info!("  GET    /api/tables/{{table_id}}/size       - Get row count");
+    info!("");
+    info!("COLUMNS:");
+    info!("  POST   /api/tables/{{table_id}}/columns             - Create column");
+    info!("  DELETE /api/tables/{{table_id}}/columns/{{col_id}}  - Drop column");
+    info!("");
+    info!("ROWS:");
+    info!("  POST   /api/tables/{{table_id}}/rows        - Insert rows");
+    info!("  GET    /api/tables/{{table_id}}/rows/{{row_id}} - Get a row");
+    info!("  DELETE /api/tables/{{table_id}}/rows        - Delete rows");
+    info!("  PUT    /api/tables/{{table_id}}/rows        - Update rows");
+    info!("═══════════════════════════════════════════════════════════════════════════");
+    info!("");
+    info!("Example requests:");
+    info!("  curl -X POST http://127.0.0.1:8080/api/tables -H 'Content-Type: application/json' \\");
+    info!("       -d '{{\"name\": \"users\"}}'");
+    info!("");
+    
+    // Start the API server
+    if let Err(e) = backend::handler::start_api_server(db_arc, "127.0.0.1", 8080).await {
+        eprintln!("API server error: {}", e);
     }
 }

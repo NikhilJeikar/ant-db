@@ -2,31 +2,25 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DataBaseErrors {
-    // Query-related errors
-    #[error("Invalid query syntax.")]
-    InvalidQuerySyntax,
-
     // Column-related errors
-    #[error("Row has {0} cells but expected {1} cells based on the table schema.")]
-    RowColumnMismatch(usize, usize),
     #[error("Column '{0}' already exists in the table.")]
     ColumnAlreadyExists(String),
-    #[error("Constraint violation for column '{0}': {1}.")]
-    ConstraintViolation(String, String),
     #[error("Column '{0}' not found in the table.")]
-    ColumnNotFound(String),
-    #[error("Maximum column limit of {0} exceeded.")]
-    MaximumColumnLimitExceeded(usize),
+    ColumnNotFound(u64),
 
     // Row-related errors
     #[error("Row with ID '{0}' not found in the table.")]
     RowNotFound(u128),
+    #[error("Multiple entries for row({0}) same column {1}")]
+    RowColumnDuplicate(u128, u64),
 
     // Table-related errors
     #[error("Table '{0}' already exists.")]
     TableAlreadyExists(String),
     #[error("Table '{0}' not found.")]
     TableNotFound(String),
+    #[error("Table '{0}' not found.")]
+    TableIDNotFound(u64),
 
     // Serialization errors
     #[error("Serialization error: {0}")]

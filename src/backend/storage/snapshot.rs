@@ -9,11 +9,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub fn write_snapshot(db: &InternalDatabaseSchema, path: &str) -> Result<(), DataBaseErrors> {
-    let bytes = to_vec(db).map_err(|e| DataBaseErrors::SerializationError(e.to_string()))?;
-    fs::write(path, bytes).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+    info!("Serializing database snapshot to {}", path);
+    let bytes = to_vec(db).map_err(|e| {
+        error!("Failed to serialize database: {}", e);
+        DataBaseErrors::SerializationError(e.to_string())
+    })?;
+    info!("Serialized database to {} bytes", bytes.len());
+    
+    fs::write(path, bytes).map_err(|e| {
+        error!("Failed to write snapshot file {}: {}", path, e);
+        DataBaseErrors::IOError(e.to_string())
+    })?;
+    
+    info!("Snapshot successfully written to {}", path);
     Ok(())
 }
 
@@ -22,12 +33,24 @@ pub fn read_snapshot_with_context(
     internal_state_manager: Arc<RwLock<InternalStateManager>>,
     wal_manager: Arc<Mutex<WALManager>>,
 ) -> Result<InternalDatabaseSchema, DataBaseErrors> {
-    let mut db: InternalDatabaseSchema =
-        from_slice(&std::fs::read(path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?)
-            .map_err(|e| DataBaseErrors::SerializationError(e.to_string()))?;
+    info!("Reading snapshot from {}", path);
+    
+    let snapshot_bytes = std::fs::read(path).map_err(|e| {
+        error!("Failed to read snapshot file {}: {}", path, e);
+        DataBaseErrors::IOError(e.to_string())
+    })?;
+    info!("Snapshot file read: {} bytes", snapshot_bytes.len());
+    
+    let mut db: InternalDatabaseSchema = from_slice(&snapshot_bytes).map_err(|e| {
+        error!("Failed to deserialize snapshot: {}", e);
+        DataBaseErrors::SerializationError(e.to_string())
+    })?;
+    debug!("Snapshot deserialized successfully");
 
     // Inject the proper contexts into the deserialized database AND all its tables
+    info!("Injecting contexts into database schema");
     db.inject_contexts(internal_state_manager, wal_manager);
+    info!("Snapshot restored with contexts");
 
     Ok(db)
 }
@@ -48,30 +71,47 @@ pub fn start_snapshot_monitor(
             check_interval_secs
         );
 
-        while !should_stop_clone.load(Ordering::Relaxed) {
+        loop {
+            if should_stop_clone.load(Ordering::Relaxed) {
+                info!("Shutdown signal received, stopping snapshot monitor");
+                break;
+            }
+            
             thread::sleep(Duration::from_secs(check_interval_secs));
+            debug!("Snapshot monitor check triggered");
 
             let wal_size = {
+                debug!("Attempting to acquire WAL lock to read size");
                 match wal_manager.lock() {
-                    Ok(wal) => wal.get_wal_size(),
+                    Ok(wal) => {
+                        let size = wal.get_wal_size();
+                        debug!("WAL lock acquired, size: {} bytes", size);
+                        size
+                    },
                     Err(e) => {
-                        error!("Failed to acquire WAL lock: {}", e);
+                        error!("Failed to acquire WAL lock for size check: {}", e);
                         continue;
                     }
                 }
             };
 
             let threshold = {
+                debug!("Attempting to acquire WAL lock to read threshold");
                 match wal_manager.lock() {
-                    Ok(wal) => wal.config.wal_threshold as u64,
+                    Ok(wal) => {
+                        let thresh = wal.config.wal_threshold as u64;
+                        debug!("WAL lock acquired, threshold: {} bytes", thresh);
+                        thresh
+                    },
                     Err(e) => {
                         error!("Failed to read WAL threshold: {}", e);
                         continue;
                     }
                 }
             };
+            
             info!(
-                "Current WAL size: {} bytes, Threshold: {} bytes",
+                "Snapshot monitor: WAL size: {} bytes, Threshold: {} bytes",
                 wal_size, threshold
             );
 
@@ -82,10 +122,13 @@ pub fn start_snapshot_monitor(
                 );
 
                 // Step 1: Briefly acquire read lock, clone DB, and release lock
+                debug!("Attempting to acquire database read lock");
                 let db_clone = match db.read() {
                     Ok(db_guard) => {
                         info!("Database read lock acquired for snapshot copy");
-                        db_guard.clone()
+                        let cloned = db_guard.clone();
+                        info!("Database snapshot cloned to memory");
+                        cloned
                     }
                     Err(e) => {
                         error!("Failed to acquire database read lock: {}", e);
@@ -93,12 +136,18 @@ pub fn start_snapshot_monitor(
                     }
                 };
                 // Lock is automatically released here
+                info!("Database read lock released");
 
                 // Step 2: Serialize to a temporary file outside the lock
                 // This can take a long time without blocking DB operations
                 let snap_path = {
+                    debug!("Acquiring WAL lock to read snapshot path");
                     match wal_manager.lock() {
-                        Ok(wal) => wal.config.snapshot_path.clone(),
+                        Ok(wal) => {
+                            let path = wal.config.snapshot_path.clone();
+                            debug!("Snapshot path retrieved: {}", path);
+                            path
+                        },
                         Err(e) => {
                             error!("Failed to read snapshot path: {}", e);
                             continue;
@@ -114,22 +163,26 @@ pub fn start_snapshot_monitor(
                         info!("Snapshot serialization completed");
 
                         // Step 3: Briefly re-acquire locks to swap files and clear WAL
+                        debug!("Attempting to acquire WAL lock for finalization");
                         match wal_manager.lock() {
-                            Ok(mut wal_guard) => match std::fs::rename(&temp_path, &snap_path) {
-                                Ok(_) => {
-                                    info!("Snapshot file moved to final location");
-                                    match wal_guard.clear_wal() {
-                                        Ok(_) => {
-                                            info!("Snapshot completed successfully, WAL cleared");
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to clear WAL: {}", e);
+                            Ok(mut wal_guard) => {
+                                debug!("WAL lock acquired for file swap");
+                                match std::fs::rename(&temp_path, &snap_path) {
+                                    Ok(_) => {
+                                        info!("Snapshot file moved from {} to {}", temp_path, snap_path);
+                                        match wal_guard.clear_wal() {
+                                            Ok(_) => {
+                                                info!("Snapshot completed: file moved and WAL cleared");
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to clear WAL after snapshot: {}", e);
+                                            }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    error!("Failed to move snapshot file: {}", e);
-                                    let _ = std::fs::remove_file(&temp_path);
+                                    Err(e) => {
+                                        error!("Failed to move snapshot file from {} to {}: {}", temp_path, snap_path, e);
+                                        let _ = std::fs::remove_file(&temp_path);
+                                    }
                                 }
                             },
                             Err(e) => {
@@ -139,7 +192,7 @@ pub fn start_snapshot_monitor(
                         }
                     }
                     Err(e) => {
-                        error!("Failed to serialize database snapshot: {}", e);
+                        error!("Failed to serialize database: {}", e);
                         let _ = std::fs::remove_file(&temp_path);
                     }
                 }
