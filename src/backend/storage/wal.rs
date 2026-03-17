@@ -28,7 +28,7 @@ pub enum DataBaseOperation {
         name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u128>,
+        index: BTreeMap<Vec<u8>, u64>,
     },
     DropColumn {
         table_id: u64,
@@ -36,16 +36,16 @@ pub enum DataBaseOperation {
     },
     InsertRow {
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     },
     DeleteRow {
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
     },
     UpdateRow {
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
         cells: Vec<InternalCell>,
     },
 }

@@ -20,7 +20,7 @@ pub struct ColumnSchema {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<Constraint>,
-    pub index: BTreeMap<Vec<u8>, u128>,
+    pub index: BTreeMap<Vec<u8>, u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,8 +41,8 @@ pub struct InternalTableSchema {
     pub table_id: u64,
     pub name: String,
     pub columns: BTreeMap<u64, ColumnSchema>,
-    pub rows: BTreeMap<u128, Vec<InternalCell>>,
-    pub next_row_id: u128,
+    pub rows: BTreeMap<u64, Vec<InternalCell>>,
+    pub next_row_id: u64,
     pub next_column_id: u64,
 
     #[serde(skip)]
@@ -61,14 +61,14 @@ pub trait TableManager {
     fn drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
 
     fn insert_rows(&mut self, rows: Vec<Vec<CellStructure>>) -> Result<(), DataBaseErrors>;
-    fn delete_rows(&mut self, row_ids: Vec<u128>) -> Result<(), DataBaseErrors>;
+    fn delete_rows(&mut self, row_ids: Vec<u64>) -> Result<(), DataBaseErrors>;
     fn update_rows(
         &mut self,
-        row_ids: Vec<u128>,
+        row_ids: Vec<u64>,
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors>;
 
-    fn get_row(&self, row_id: u128) -> Result<Vec<CellStructure>, DataBaseErrors>;
+    fn get_row(&self, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors>;
 
     fn get_size(&self) -> usize;
     fn get_schema(&self) -> Result<TableSchema, DataBaseErrors>;
@@ -81,18 +81,18 @@ pub trait TableWriteAheadLog: WriteAheadLogBase {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u128>,
+        index: BTreeMap<Vec<u8>, u64>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
         &mut self,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_delete_row(&mut self, row_id: u128) -> Result<(), DataBaseErrors>;
+    fn wal_delete_row(&mut self, row_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_update_row(
         &mut self,
-        row_id: u128,
+        row_id: u64,
         cells: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors>;
 }
@@ -160,31 +160,33 @@ impl InternalTableSchema {
 
     fn internal_insert_row(
         &mut self,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
         if let Some(col) = Self::duplicate_cells(&row) {
             return Err(DataBaseErrors::RowColumnDuplicate(row_id, col));
         }
 
+        let row_id_u64 = row_id as u64;
         for cell in &row {
             let column = match self.columns.get_mut(&cell.column_id) {
                 Some(c) => c,
                 None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
             };
 
-            column.index.insert(cell.data.clone(), row_id);
+            column.index.insert(cell.data.clone(), row_id_u64);
         }
 
-        self.rows.insert(row_id, row);
+        self.rows.insert(row_id_u64, row);
 
         Ok(())
     }
 
-    fn internal_delete_row(&mut self, row_id: u128) -> Result<(), DataBaseErrors> {
+    fn internal_delete_row(&mut self, row_id: u64) -> Result<(), DataBaseErrors> {
+        let row_id_u64 = row_id as u64;
         let row = self
             .rows
-            .remove(&row_id)
+            .remove(&row_id_u64)
             .ok_or(DataBaseErrors::RowNotFound(row_id))?;
 
         for cell in &row {
@@ -203,7 +205,7 @@ impl InternalTableSchema {
 
     fn internal_update_row(
         &mut self,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
         if let Some(col) = Self::duplicate_cells(&row) {
@@ -342,7 +344,7 @@ impl TableManager for InternalTableSchema {
         Ok(())
     }
 
-    fn delete_rows(&mut self, row_ids: Vec<u128>) -> Result<(), DataBaseErrors> {
+    fn delete_rows(&mut self, row_ids: Vec<u64>) -> Result<(), DataBaseErrors> {
         for row_id in &row_ids {
             if !self.rows.iter().any(|r| *r.0 == *row_id) {
                 return Err(DataBaseErrors::RowNotFound(*row_id));
@@ -364,7 +366,7 @@ impl TableManager for InternalTableSchema {
 
     fn update_rows(
         &mut self,
-        row_ids: Vec<u128>,
+        row_ids: Vec<u64>,
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors> {
         for row_id in &row_ids {
@@ -397,7 +399,7 @@ impl TableManager for InternalTableSchema {
         Ok(())
     }
 
-    fn get_row(&self, row_id: u128) -> Result<Vec<CellStructure>, DataBaseErrors> {
+    fn get_row(&self, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors> {
         let row = self
             .rows
             .iter()
@@ -435,7 +437,7 @@ impl TableWriteAheadLog for InternalTableSchema {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u128>,
+        index: BTreeMap<Vec<u8>, u64>,
     ) -> Result<(), DataBaseErrors> {
         if self.columns.iter().any(|c| c.1.name == column_name) {
             return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
@@ -463,7 +465,7 @@ impl TableWriteAheadLog for InternalTableSchema {
     }
     fn wal_insert_row(
         &mut self,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
         if row_id >= self.next_row_id {
@@ -471,12 +473,12 @@ impl TableWriteAheadLog for InternalTableSchema {
         }
         self.internal_insert_row(row_id, row)
     }
-    fn wal_delete_row(&mut self, row_id: u128) -> Result<(), DataBaseErrors> {
+    fn wal_delete_row(&mut self, row_id: u64) -> Result<(), DataBaseErrors> {
         self.internal_delete_row(row_id)
     }
     fn wal_update_row(
         &mut self,
-        row_id: u128,
+        row_id: u64,
         cells: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
         self.internal_update_row(row_id, cells)

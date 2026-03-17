@@ -55,7 +55,7 @@ pub struct InsertRowsResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeleteRowsRequest {
-    pub row_ids: Vec<u128>,
+    pub row_ids: Vec<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -67,7 +67,7 @@ pub struct DeleteRowsResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpdateRowsRequest {
-    pub row_ids: Vec<u128>,
+    pub row_ids: Vec<u64>,
     pub new_values: Vec<CellStructure>,
 }
 
@@ -88,6 +88,28 @@ pub struct ListTablesResponse {
 pub struct ErrorResponse {
     pub error: String,
     pub status: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetRowResponse {
+    pub table_id: u64,
+    pub row_id: u64,
+    pub cells: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ColumnSchemaResponse {
+    pub column_id: u64,
+    pub name: String,
+    pub data_type: DataType,
+    pub constraints: Vec<Constraint>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SchemaResponse {
+    pub table_id: u64,
+    pub table_name: String,
+    pub columns: Vec<ColumnSchemaResponse>,
 }
 
 // ==================== Helper Functions ====================
@@ -228,7 +250,27 @@ pub async fn get_table_schema(
             match db_guard.get_table_schema(table_id) {
                 Ok(schema) => {
                     info!("API: Schema retrieved for table {}", table_id);
-                    HttpResponse::Ok().json(schema)
+                    
+                    // Convert to JSON-safe response format (excluding indexes with non-string keys)
+                    let columns: Vec<ColumnSchemaResponse> = schema
+                        .columns
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, col)| ColumnSchemaResponse {
+                            column_id: idx as u64,
+                            name: col.name,
+                            data_type: col.data_type,
+                            constraints: col.constraints,
+                        })
+                        .collect();
+                    
+                    let response = SchemaResponse {
+                        table_id,
+                        table_name: schema.name,
+                        columns,
+                    };
+                    
+                    HttpResponse::Ok().json(response)
                 }
                 Err(e) => error_to_response(e),
             }
@@ -361,7 +403,7 @@ pub async fn insert_rows(
 /// GET /api/tables/{table_id}/rows/{row_id}
 pub async fn get_row(
     db: web::Data<Database>,
-    path: web::Path<(u64, u128)>,
+    path: web::Path<(u64, u64)>,
 ) -> impl Responder {
     let (table_id, row_id) = path.into_inner();
     debug!("API: Getting row {} from table {}", row_id, table_id);
@@ -371,11 +413,18 @@ pub async fn get_row(
             match db_guard.get_row(table_id, row_id) {
                 Ok(row) => {
                     info!("API: Row {} retrieved from table {}", row_id, table_id);
-                    HttpResponse::Ok().json(serde_json::json!({
-                        "table_id": table_id,
-                        "row_id": row_id,
-                        "cells": row
-                    }))
+                    
+                    // Convert CellStructure to JSON-safe format
+                    let cells: Vec<serde_json::Value> = row
+                        .into_iter()
+                        .filter_map(|cell| serde_json::to_value(cell).ok())
+                        .collect();
+                    
+                    HttpResponse::Ok().json(GetRowResponse {
+                        table_id,
+                        row_id,
+                        cells,
+                    })
                 }
                 Err(e) => error_to_response(e),
             }

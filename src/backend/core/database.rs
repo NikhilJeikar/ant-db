@@ -83,14 +83,14 @@ pub trait DataBaseManager {
         table_id: u64,
         rows: Vec<Vec<CellStructure>>,
     ) -> Result<(), DataBaseErrors>;
-    fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u128>) -> Result<(), DataBaseErrors>;
+    fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u64>) -> Result<(), DataBaseErrors>;
     fn update_rows(
         &mut self,
         table_id: u64,
-        row_ids: Vec<u128>,
+        row_ids: Vec<u64>,
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors>;
-    fn get_row(&self, table_id: u64, row_id: u128) -> Result<Vec<CellStructure>, DataBaseErrors>;
+    fn get_row(&self, table_id: u64, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors>;
 }
 
 pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
@@ -103,20 +103,20 @@ pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: BTreeMap<Vec<u8>, u128>,
+        index: BTreeMap<Vec<u8>, u64>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_insert_row(
         &mut self,
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_delete_row(&mut self, table_id: u64, row_id: u128) -> Result<(), DataBaseErrors>;
+    fn wal_delete_row(&mut self, table_id: u64, row_id: u64) -> Result<(), DataBaseErrors>;
     fn wal_update_row(
         &mut self,
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
         cells: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors>;
 }
@@ -220,7 +220,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         column_name: String,
         data_type: crate::backend::schema::DataType,
         constraints: Vec<crate::backend::schema::Constraint>,
-        index: BTreeMap<Vec<u8>, u128>,
+        index: BTreeMap<Vec<u8>, u64>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -244,7 +244,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
     fn wal_insert_row(
         &mut self,
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
         row: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
@@ -253,7 +253,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_delete_row(&mut self, table_id: u64, row_id: u128) -> Result<(), DataBaseErrors> {
+    fn wal_delete_row(&mut self, table_id: u64, row_id: u64) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_delete_row(row_id),
@@ -263,7 +263,7 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
     fn wal_update_row(
         &mut self,
         table_id: u64,
-        row_id: u128,
+        row_id: u64,
         cells: Vec<InternalCell>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
@@ -453,7 +453,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u128>) -> Result<(), DataBaseErrors> {
+    fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u64>) -> Result<(), DataBaseErrors> {
         let row_count = row_ids.len();
         debug!("Deleting {} rows from table {}: {:?}", row_count, table_id, row_ids);
         match self.tables.get(&table_id) {
@@ -484,7 +484,7 @@ impl DataBaseManager for InternalDatabaseSchema {
     fn update_rows(
         &mut self,
         table_id: u64,
-        row_ids: Vec<u128>,
+        row_ids: Vec<u64>,
         new_values: Vec<CellStructure>,
     ) -> Result<(), DataBaseErrors> {
         let row_count = row_ids.len();
@@ -514,7 +514,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn get_row(&self, table_id: u64, row_id: u128) -> Result<Vec<CellStructure>, DataBaseErrors> {
+    fn get_row(&self, table_id: u64, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors> {
         debug!("Fetching row {} from table {}", row_id, table_id);
         match self.tables.get(&table_id) {
             None => {

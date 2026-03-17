@@ -10,9 +10,9 @@ pub enum DataBaseErrors {
 
     // Row-related errors
     #[error("Row with ID '{0}' not found in the table.")]
-    RowNotFound(u128),
+    RowNotFound(u64),
     #[error("Multiple entries for row({0}) same column {1}")]
-    RowColumnDuplicate(u128, u64),
+    RowColumnDuplicate(u64, u64),
 
     // Table-related errors
     #[error("Table '{0}' already exists.")]
