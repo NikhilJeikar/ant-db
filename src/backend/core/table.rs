@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::search::{OrderBy, Projection, SearchCriteria, SearchOperator, SortBy};
@@ -139,14 +139,7 @@ impl InternalTableSchema {
         for (row_id, cells) in self.rows.iter() {
             if let Some(cell) = cells.iter().find(|c| c.column_id == column_id) {
                 let key = cell.get_key();
-                match new_index.get_mut(&key) {
-                    Some(ids) => {
-                        ids.push(*row_id);
-                    }
-                    None => {
-                        new_index.insert(key, vec![*row_id]);
-                    }
-                };
+                new_index.entry(key).or_default().insert(*row_id);
             }
         }
 
@@ -186,10 +179,7 @@ impl InternalTableSchema {
                 .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
 
             if let Some(index) = column.index.as_mut() {
-                index
-                    .entry(cell.get_key())
-                    .or_insert_with(Vec::new)
-                    .push(row_id);
+                index.entry(cell.get_key()).or_default().insert(row_id);
             }
         }
 
@@ -207,7 +197,7 @@ impl InternalTableSchema {
                 let key = cell.get_key();
                 if let Entry::Occupied(mut entry) = index.entry(key) {
                     let ids = entry.get_mut();
-                    ids.retain(|id| *id != row_id);
+                    ids.remove(&row_id);
                     if ids.is_empty() {
                         entry.remove();
                     }
@@ -240,6 +230,59 @@ impl InternalTableSchema {
         self.rows.insert(row_id, row.clone());
 
         Ok(())
+    }
+
+    fn indexed_row_candidates(
+        &self,
+        search_criterias: &[SearchCriteria],
+    ) -> Option<BTreeSet<RowId>> {
+        let mut candidates: Option<BTreeSet<RowId>> = None;
+
+        for criteria in search_criterias {
+            if !matches!(criteria.operator, SearchOperator::Equal) {
+                continue;
+            }
+
+            let Some(column) = self.columns.get(&criteria.column_id) else {
+                continue;
+            };
+            let Some(index) = column.index.as_ref() else {
+                continue;
+            };
+
+            let bucket = index
+                .get(&criteria.value.hash_key())
+                .cloned()
+                .unwrap_or_default();
+
+            match candidates.as_mut() {
+                Some(existing) => {
+                    existing.retain(|row_id| bucket.contains(row_id));
+                    if existing.is_empty() {
+                        break;
+                    }
+                }
+                None => candidates = Some(bucket),
+            }
+        }
+
+        candidates
+    }
+
+    fn row_matches_criteria(row: &Row, search_criterias: &[SearchCriteria]) -> bool {
+        search_criterias.iter().all(|criteria| {
+            row.iter()
+                .find(|cell| cell.column_id == criteria.column_id)
+                .map(|cell| match criteria.operator {
+                    SearchOperator::Equal => cell.data == criteria.value,
+                    SearchOperator::NotEqual => cell.data != criteria.value,
+                    SearchOperator::GreaterThan => cell.data > criteria.value,
+                    SearchOperator::LessThan => cell.data < criteria.value,
+                    SearchOperator::GreaterThanOrEqual => cell.data >= criteria.value,
+                    SearchOperator::LessThanOrEqual => cell.data <= criteria.value,
+                })
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -437,8 +480,8 @@ impl TableManager for InternalTableSchema {
                     .entry(cell.column_id)
                     .or_insert_with(BTreeMap::new)
                     .entry(cell.get_key())
-                    .or_insert_with(Vec::new)
-                    .push(*row_id);
+                    .or_default()
+                    .insert(*row_id);
             }
         }
 
@@ -454,7 +497,7 @@ impl TableManager for InternalTableSchema {
             if let Some(column) = self.columns.get_mut(&col_id) {
                 if let Some(index) = column.index.as_mut() {
                     for (data, ids) in data_map {
-                        index.entry(data).or_insert_with(Vec::new).extend(ids);
+                        index.entry(data).or_default().extend(ids);
                     }
                 }
             }
@@ -545,24 +588,19 @@ impl TableManager for InternalTableSchema {
     ) -> Result<Vec<Row>, DataBaseErrors> {
         let mut matched_rows: Vec<Row> = Vec::new();
 
-        // Phase 1: Filter rows based on search criteria (work with CellSchema)
-        for (_row_id, row) in &self.rows {
-            let is_match = search_criterias.iter().all(|criteria| {
-                row.iter()
-                    .find(|cell| cell.column_id == criteria.column_id)
-                    .map(|cell| match criteria.operator {
-                        SearchOperator::Equal => cell.data == criteria.value,
-                        SearchOperator::NotEqual => cell.data != criteria.value,
-                        SearchOperator::GreaterThan => cell.data > criteria.value,
-                        SearchOperator::LessThan => cell.data < criteria.value,
-                        SearchOperator::GreaterThanOrEqual => cell.data >= criteria.value,
-                        SearchOperator::LessThanOrEqual => cell.data <= criteria.value,
-                    })
-                    .unwrap_or(false)
-            });
-
-            if is_match {
-                matched_rows.push(row.clone());
+        if let Some(candidate_row_ids) = self.indexed_row_candidates(&search_criterias) {
+            for row_id in candidate_row_ids {
+                if let Some(row) = self.rows.get(&row_id) {
+                    if Self::row_matches_criteria(row, &search_criterias) {
+                        matched_rows.push(row.clone());
+                    }
+                }
+            }
+        } else {
+            for row in self.rows.values() {
+                if Self::row_matches_criteria(row, &search_criterias) {
+                    matched_rows.push(row.clone());
+                }
             }
         }
 

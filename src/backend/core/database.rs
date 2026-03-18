@@ -568,52 +568,32 @@ impl DataBaseManager for InternalDatabaseSchema {
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
-                return Err(DataBaseErrors::TableIDNotFound(table_id));
+                Err(DataBaseErrors::TableIDNotFound(table_id))
             }
             Some(i) => {
                 debug!(
                     "Acquiring write lock for table {} to insert {} rows",
                     table_id, row_count
                 );
-                let start_row_id = match i.write() {
+                match i.write() {
                     Ok(mut guard) => {
                         let start_row_id = guard.next_row_id;
-                        guard.next_row_id += row_count as u64;
-                        start_row_id
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        return Err(DataBaseErrors::WalLockError);
-                    }
-                };
-
-                let proccessed_row = match i.read() {
-                    Ok(guard) => {
-                        let result = guard.pre_insert_rows(&rows, start_row_id);
-                        match &result {
+                        let processed_rows = guard.pre_insert_rows(&rows, start_row_id);
+                        match &processed_rows {
                             Ok(_) => info!("Successfully computed rows"),
                             Err(e) => error!("Failed computing rows: {}", e),
                         }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire read lock: {}", e);
-                        return Err(DataBaseErrors::WalLockError);
-                    }
-                };
-                let proccessed_row = match proccessed_row {
-                    Ok(r) => r,
-                    Err(e) => return Err(e),
-                };
+                        let processed_rows = processed_rows?;
 
-                match i.write() {
-                    Ok(mut guard) => {
-                        let result = guard.insert_rows(proccessed_row);
+                        let result = guard.insert_rows(processed_rows);
                         match &result {
-                            Ok(_) => info!(
-                                "Successfully inserted {} rows into table {}",
-                                row_count, table_id
-                            ),
+                            Ok(_) => {
+                                guard.next_row_id += row_count as u64;
+                                info!(
+                                    "Successfully inserted {} rows into table {}",
+                                    row_count, table_id
+                                )
+                            }
                             Err(e) => error!(
                                 "Failed to insert {} rows into table {}: {}",
                                 row_count, table_id, e
@@ -647,10 +627,10 @@ impl DataBaseManager for InternalDatabaseSchema {
                     table_id, row_count
                 );
 
-                match table_arc.read() {
-                    Ok(guard) => {
-                        let result = guard.pre_delete_rows(&row_ids);
-                        match &result {
+                match table_arc.write() {
+                    Ok(mut guard) => {
+                        let validation = guard.pre_delete_rows(&row_ids);
+                        match &validation {
                             Ok(_) => info!(
                                 "Successfully computed rows to delete from table {}",
                                 table_id
@@ -660,16 +640,8 @@ impl DataBaseManager for InternalDatabaseSchema {
                                 table_id, e
                             ),
                         }
-                        result?
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        return Err(DataBaseErrors::WalLockError);
-                    }
-                }
+                        validation?;
 
-                match table_arc.write() {
-                    Ok(mut guard) => {
                         let result = guard.delete_rows(row_ids);
                         match &result {
                             Ok(_) => info!(
@@ -711,10 +683,10 @@ impl DataBaseManager for InternalDatabaseSchema {
                     table_id, row_count
                 );
 
-                let validation_result = match db_arc.read() {
-                    Ok(guard) => {
-                        let result = guard.pre_update_rows(&row_ids, &new_values);
-                        match &result {
+                match db_arc.write() {
+                    Ok(mut guard) => {
+                        let validation_result = guard.pre_update_rows(&row_ids, &new_values);
+                        match &validation_result {
                             Ok(_) => info!(
                                 "Successfully validated rows to update in table {}",
                                 table_id
@@ -724,17 +696,8 @@ impl DataBaseManager for InternalDatabaseSchema {
                                 table_id, e
                             ),
                         }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire read lock: {}", e);
-                        return Err(DataBaseErrors::WalLockError);
-                    }
-                };
-                validation_result?;
+                        validation_result?;
 
-                match db_arc.write() {
-                    Ok(mut guard) => {
                         let result = guard.update_rows(row_ids, new_values);
                         match &result {
                             Ok(_) => info!(

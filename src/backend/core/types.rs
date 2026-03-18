@@ -1,11 +1,9 @@
 use crate::backend::config::InternalStateManager;
-use crate::backend::errors::DataBaseErrors;
 use crate::backend::storage::wal::WriteAheadLogManager;
 use ordered_float::NotNan;
-use rmp_serde::to_vec;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::hash::Hasher;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock};
 use twox_hash::XxHash64;
 
@@ -15,11 +13,11 @@ pub type ColumnId = u64;
 
 pub type HashType = u64;
 
-pub type Index = BTreeMap<HashType, Vec<RowId>>;
+pub type Index = BTreeMap<HashType, BTreeSet<RowId>>;
 
 pub type Row = Vec<CellSchema>;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub enum DecodedData {
     IntegerU8(u8),
     IntegerU16(u16),
@@ -39,6 +37,12 @@ pub enum DecodedData {
 }
 
 impl DecodedData {
+    pub fn hash_key(&self) -> HashType {
+        let mut hasher = XxHash64::with_seed(0);
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             DecodedData::IntegerU8(_) => "U8",
@@ -138,14 +142,8 @@ pub struct CellSchema {
 }
 
 impl CellSchema {
-    pub fn get_binary_data(&self) -> Result<Vec<u8>, DataBaseErrors> {
-        to_vec(&self.data).map_err(|e| DataBaseErrors::SerializationError(e.to_string()))
-    }
-
     pub fn get_key(&self) -> HashType {
-        let mut hasher = XxHash64::with_seed(0);
-        hasher.write(&self.get_binary_data().unwrap());
-        hasher.finish()
+        self.data.hash_key()
     }
 }
 
