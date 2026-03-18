@@ -3,4 +3,5 @@
 *.wal
 *.db
 
-test/*
+*/.venv/*
+*.pyc
