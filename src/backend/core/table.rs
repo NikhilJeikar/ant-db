@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, HashSet};
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::search::{OrderBy, Projection, SearchCriteria, SearchOperator, SortBy};
 use crate::backend::core::types::{
-    ColumnId, ColumnSchema, Constraint, DataType, DecodedData, Index, InternalTableSchema, Row, RowId, TableId, TableSchema
+    ColumnId, ColumnSchema, Constraint, DataType, DecodedData, Index, InternalTableSchema, Row,
+    RowId, TableId, TableSchema,
 };
 use crate::backend::errors::DataBaseErrors;
 use crate::backend::storage::wal::{DataBaseOperation, WriteAheadLogBase, WriteAheadLogManager};
@@ -56,7 +57,8 @@ pub trait TableWriteAheadLog: WriteAheadLogBase {
         index: Option<Index>,
     ) -> Result<(), DataBaseErrors>;
     fn wal_drop_column(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
-    fn wal_create_index(&mut self, column_id: ColumnId, index: Index) -> Result<(), DataBaseErrors>;
+    fn wal_create_index(&mut self, column_id: ColumnId, index: Index)
+    -> Result<(), DataBaseErrors>;
     fn wal_drop_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
 
     fn wal_insert_rows(&mut self, rows: Vec<(RowId, Row)>) -> Result<(), DataBaseErrors>;
@@ -219,17 +221,26 @@ impl InternalTableSchema {
     fn apply_row_update(&mut self, row_id: RowId, row: &Row) -> Result<(), DataBaseErrors> {
         let existing_row = self
             .rows
-            .get(&row_id)
-            .cloned()
+            .remove(&row_id)
             .ok_or(DataBaseErrors::RowNotFound(row_id))?;
 
-        self.remove_row_from_indexes(row_id, &existing_row)?;
-        self.add_row_to_indexes(row_id, row)?;
+        if let Err(err) = self.remove_row_from_indexes(row_id, &existing_row) {
+            let _ = self.add_row_to_indexes(row_id, &existing_row);
+            self.rows.insert(row_id, existing_row);
+            return Err(err);
+        }
+
+        if let Err(err) = self.add_row_to_indexes(row_id, row) {
+            let _ = self.remove_row_from_indexes(row_id, row);
+            let _ = self.add_row_to_indexes(row_id, &existing_row);
+            self.rows.insert(row_id, existing_row);
+            return Err(err);
+        }
+
         self.rows.insert(row_id, row.clone());
 
         Ok(())
     }
-
 }
 
 impl WriteAheadLogBase for InternalTableSchema {
@@ -675,7 +686,11 @@ impl TableWriteAheadLog for InternalTableSchema {
         Ok(())
     }
 
-    fn wal_create_index(&mut self, column_id: ColumnId, index: Index) -> Result<(), DataBaseErrors> {
+    fn wal_create_index(
+        &mut self,
+        column_id: ColumnId,
+        index: Index,
+    ) -> Result<(), DataBaseErrors> {
         let column = self
             .columns
             .get_mut(&column_id)
@@ -727,5 +742,4 @@ impl TableWriteAheadLog for InternalTableSchema {
 
         Ok(())
     }
-
 }

@@ -72,18 +72,18 @@ pub trait DataBaseManager {
     fn list_tables(&self) -> Vec<String>;
 
     fn create_column(
-        &mut self,
+        &self,
         table_id: TableId,
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
     ) -> Result<ColumnId, DataBaseErrors>;
-    fn drop_column(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
-    fn create_index(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
-    fn drop_index(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn drop_column(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn create_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn drop_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
 
-    fn insert_rows(&mut self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors>;
-    fn delete_rows(&mut self, table_id: TableId, row_ids: Vec<ColumnId>) -> Result<(), DataBaseErrors>;
+    fn insert_rows(&self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors>;
+    fn delete_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors>;
     fn update_rows(
         &self,
         table_id: TableId,
@@ -112,20 +112,32 @@ pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
         constraints: Vec<Constraint>,
         index: Option<Index>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_column(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn wal_drop_column(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors>;
     fn wal_create_index(
         &mut self,
         table_id: TableId,
         column_id: ColumnId,
         index: Index,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_index(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn wal_drop_index(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors>;
     fn wal_insert_rows(
         &mut self,
         table_id: TableId,
         rows: Vec<(RowId, Row)>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_delete_rows(&mut self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors>;
+    fn wal_delete_rows(
+        &mut self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+    ) -> Result<(), DataBaseErrors>;
     fn wal_update_rows(
         &mut self,
         table_id: TableId,
@@ -256,7 +268,11 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_drop_column(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
+    fn wal_drop_column(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_drop_column(column_id),
@@ -275,7 +291,11 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_drop_index(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
+    fn wal_drop_index(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_drop_index(column_id),
@@ -293,7 +313,11 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_delete_rows(&mut self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
+    fn wal_delete_rows(
+        &mut self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+    ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_delete_rows(row_ids),
@@ -405,7 +429,7 @@ impl DataBaseManager for InternalDatabaseSchema {
     }
 
     fn create_column(
-        &mut self,
+        &self,
         table_id: TableId,
         column_name: String,
         data_type: DataType,
@@ -441,7 +465,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn drop_column(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
+    fn drop_column(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         debug!("Dropping column {} from table {}", column_id, table_id);
         match self.tables.get(&table_id) {
             None => {
@@ -468,7 +492,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn create_index(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
+    fn create_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         debug!(
             "Creating index for column {} in table {}",
             column_id, table_id
@@ -503,7 +527,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn drop_index(&mut self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
+    fn drop_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         debug!(
             "Dropping index for column {} in table {}",
             column_id, table_id
@@ -538,7 +562,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn insert_rows(&mut self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors> {
+    fn insert_rows(&self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors> {
         let row_count = rows.len();
         debug!("Inserting {} rows into table {}", row_count, table_id);
         match self.tables.get(&table_id) {
@@ -606,66 +630,66 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn delete_rows(&mut self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
+    fn delete_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
         let row_count = row_ids.len();
         debug!(
             "Deleting {} rows from table {}: {:?}",
             row_count, table_id, row_ids
         );
         match self.tables.get(&table_id) {
-        None => {
-            error!("Table not found: {}", table_id);
-            return Err(DataBaseErrors::TableIDNotFound(table_id));
-        }
-        Some(table_arc) => {
-            debug!(
-                "Acquiring write lock for table {} to delete {} rows",
-                table_id, row_count
-            );
+            None => {
+                error!("Table not found: {}", table_id);
+                Err(DataBaseErrors::TableIDNotFound(table_id))
+            }
+            Some(table_arc) => {
+                debug!(
+                    "Acquiring write lock for table {} to delete {} rows",
+                    table_id, row_count
+                );
 
-            match table_arc.read() {
-                Ok(guard) => {
-                    let result = guard.pre_delete_rows(&row_ids);
-                    match &result {
-                        Ok(_) => info!(
-                            "Successfully computed rows to delete from table {}",
-                            table_id
-                        ),
-                        Err(e) => error!(
-                            "Failed to compute rows to delete from table {}: {}",
-                            table_id, e
-                        ),
+                match table_arc.read() {
+                    Ok(guard) => {
+                        let result = guard.pre_delete_rows(&row_ids);
+                        match &result {
+                            Ok(_) => info!(
+                                "Successfully computed rows to delete from table {}",
+                                table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to compute rows to delete from table {}: {}",
+                                table_id, e
+                            ),
+                        }
+                        result?
+                    }
+                    Err(e) => {
+                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
+                        return Err(DataBaseErrors::WalLockError);
                     }
                 }
-                Err(e) => {
-                    error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                    return Err(DataBaseErrors::WalLockError);
-                }
-            };
 
-            match table_arc.write() {
-                Ok(mut guard) => {
-                    let result = guard.delete_rows(row_ids);
-                    match &result {
-                        Ok(_) => info!(
-                            "Successfully deleted {} rows from table {}",
-                            row_count, table_id
-                        ),
-                        Err(e) => error!(
-                            "Failed to delete {} rows from table {}: {}",
-                            row_count, table_id, e
-                        ),
+                match table_arc.write() {
+                    Ok(mut guard) => {
+                        let result = guard.delete_rows(row_ids);
+                        match &result {
+                            Ok(_) => info!(
+                                "Successfully deleted {} rows from table {}",
+                                row_count, table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to delete {} rows from table {}: {}",
+                                row_count, table_id, e
+                            ),
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
+                        Err(DataBaseErrors::WalLockError)
                     }
                 }
-                Err(e) => {
-                    error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                    return Err(DataBaseErrors::WalLockError);
-                }
-            };
-            Ok(())
-
+            }
         }
-    }
     }
 
     fn update_rows(
@@ -728,7 +752,6 @@ impl DataBaseManager for InternalDatabaseSchema {
                         error!("Failed to acquire write lock for table {}: {}", table_id, e);
                         Err(DataBaseErrors::WalLockError)
                     }
-                    
                 }
             }
         }
@@ -740,29 +763,22 @@ impl DataBaseManager for InternalDatabaseSchema {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
             }
-            Some(db_arc) => {
-                match db_arc.read() {
-                    Ok(guard) => {
-                        let result = guard.get_rows(&row_ids);
-                        match &result {
-                            Ok(rows) => debug!(
-                                "Rows({}) retrieved from table {}",
-                                rows.len(),
-                                table_id
-                            ),
-                            Err(e) => error!(
-                                "Failed to fetch rows from table {}: {}",
-                                table_id, e
-                            ),
+            Some(db_arc) => match db_arc.read() {
+                Ok(guard) => {
+                    let result = guard.get_rows(&row_ids);
+                    match &result {
+                        Ok(rows) => {
+                            debug!("Rows({}) retrieved from table {}", rows.len(), table_id)
                         }
-                        result
+                        Err(e) => error!("Failed to fetch rows from table {}: {}", table_id, e),
                     }
-                    Err(e) => {
-                        error!("Failed to acquire read lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
+                    result
                 }
-            }
+                Err(e) => {
+                    error!("Failed to acquire read lock for table {}: {}", table_id, e);
+                    Err(DataBaseErrors::WalLockError)
+                }
+            },
         }
     }
 

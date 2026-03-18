@@ -344,8 +344,8 @@ pub async fn create_column(
         req.column_name, table_id
     );
 
-    match db.write() {
-        Ok(mut db_guard) => {
+    match db.read() {
+        Ok(db_guard) => {
             match db_guard.create_column(
                 table_id,
                 req.column_name.clone(),
@@ -364,7 +364,7 @@ pub async fn create_column(
                 Err(e) => error_to_response(e),
             }
         }
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
@@ -374,8 +374,8 @@ pub async fn drop_column(db: web::Data<Database>, path: web::Path<(u64, u64)>) -
     let (table_id, column_id) = path.into_inner();
     debug!("API: Dropping column {} from table {}", column_id, table_id);
 
-    match db.write() {
-        Ok(mut db_guard) => match db_guard.drop_column(table_id, column_id) {
+    match db.read() {
+        Ok(db_guard) => match db_guard.drop_column(table_id, column_id) {
             Ok(_) => {
                 info!("API: Column {} dropped from table {}", column_id, table_id);
                 HttpResponse::Ok().json(serde_json::json!({
@@ -386,7 +386,7 @@ pub async fn drop_column(db: web::Data<Database>, path: web::Path<(u64, u64)>) -
             }
             Err(e) => error_to_response(e),
         },
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
@@ -399,8 +399,8 @@ pub async fn create_index(db: web::Data<Database>, path: web::Path<(u64, u64)>) 
         column_id, table_id
     );
 
-    match db.write() {
-        Ok(mut db_guard) => match db_guard.create_index(table_id, column_id) {
+    match db.read() {
+        Ok(db_guard) => match db_guard.create_index(table_id, column_id) {
             Ok(_) => {
                 info!(
                     "API: Index created for column {} in table {}",
@@ -414,7 +414,7 @@ pub async fn create_index(db: web::Data<Database>, path: web::Path<(u64, u64)>) 
             }
             Err(e) => error_to_response(e),
         },
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
@@ -427,8 +427,8 @@ pub async fn drop_index(db: web::Data<Database>, path: web::Path<(u64, u64)>) ->
         column_id, table_id
     );
 
-    match db.write() {
-        Ok(mut db_guard) => match db_guard.drop_index(table_id, column_id) {
+    match db.read() {
+        Ok(db_guard) => match db_guard.drop_index(table_id, column_id) {
             Ok(_) => {
                 info!(
                     "API: Index dropped for column {} in table {}",
@@ -442,7 +442,7 @@ pub async fn drop_index(db: web::Data<Database>, path: web::Path<(u64, u64)>) ->
             }
             Err(e) => error_to_response(e),
         },
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
@@ -459,8 +459,8 @@ pub async fn insert_rows(
     let row_count = req.rows.len();
     debug!("API: Inserting {} rows into table {}", row_count, table_id);
 
-    match db.write() {
-        Ok(mut db_guard) => match db_guard.insert_rows(table_id, req.rows.clone()) {
+    match db.read() {
+        Ok(db_guard) => match db_guard.insert_rows(table_id, req.rows.clone()) {
             Ok(_) => {
                 info!("API: {} rows inserted into table {}", row_count, table_id);
                 HttpResponse::Created().json(InsertRowsResponse {
@@ -471,7 +471,7 @@ pub async fn insert_rows(
             }
             Err(e) => error_to_response(e),
         },
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
@@ -484,7 +484,11 @@ pub async fn get_rows(
 ) -> impl Responder {
     let table_id = table_id.into_inner();
     let row_ids = req.row_ids.clone();
-    debug!("API: Getting {} rows from table {}", row_ids.len(), table_id);
+    debug!(
+        "API: Getting {} rows from table {}",
+        row_ids.len(),
+        table_id
+    );
 
     match db.read() {
         Ok(db_guard) => match db_guard.get_rows(table_id, row_ids.clone()) {
@@ -529,8 +533,8 @@ pub async fn delete_rows(
         deleted_count, table_id
     );
 
-    match db.write() {
-        Ok(mut db_guard) => match db_guard.delete_rows(table_id, req.row_ids.clone()) {
+    match db.read() {
+        Ok(db_guard) => match db_guard.delete_rows(table_id, req.row_ids.clone()) {
             Ok(_) => {
                 info!(
                     "API: {} rows deleted from table {}",
@@ -544,7 +548,7 @@ pub async fn delete_rows(
             }
             Err(e) => error_to_response(e),
         },
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
