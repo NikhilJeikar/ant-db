@@ -1,5 +1,5 @@
 wal_path = "db/my_wal.log"
 snapshot_path = "db/snapshot.db"
-wal_threshold = 1024
-log_path = "event-db.log"
-wal_sync_interval = 360
+wal_threshold = 102400
+log_path = "db/event-db.log"
+wal_sync_interval = 30

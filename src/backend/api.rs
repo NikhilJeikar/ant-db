@@ -1,8 +1,7 @@
 use crate::backend::core::database::{DataBaseManager, InternalDatabaseSchema};
 use crate::backend::core::search::{Projection, SearchCriteria, SortBy};
-use crate::backend::core::table::CellStructure;
+use crate::backend::core::types::{Constraint, DataType, Row};
 use crate::backend::errors::DataBaseErrors;
-use crate::backend::schema::{Constraint, DataType};
 use actix_web::{HttpResponse, Responder, web};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -44,7 +43,7 @@ pub struct CreateColumnResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InsertRowsRequest {
-    pub rows: Vec<Vec<CellStructure>>,
+    pub rows: Vec<Row>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -69,7 +68,7 @@ pub struct DeleteRowsResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpdateRowsRequest {
     pub row_ids: Vec<u64>,
-    pub new_values: Vec<CellStructure>,
+    pub new_values: Row,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -106,10 +105,21 @@ pub struct DropIndexResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct GetRowResponse {
-    pub table_id: u64,
+pub struct GetRowsRequest {
+    pub row_ids: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RowResponse {
     pub row_id: u64,
     pub cells: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetRowsResponse {
+    pub table_id: u64,
+    pub row_count: usize,
+    pub rows: Vec<RowResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -465,33 +475,42 @@ pub async fn insert_rows(
     }
 }
 
-/// Get a specific row
-/// GET /api/tables/{table_id}/rows/{row_id}
-pub async fn get_row(db: web::Data<Database>, path: web::Path<(u64, u64)>) -> impl Responder {
-    let (table_id, row_id) = path.into_inner();
-    debug!("API: Getting row {} from table {}", row_id, table_id);
+/// Get multiple rows from a table
+/// POST /api/tables/{table_id}/rows/get
+pub async fn get_rows(
+    db: web::Data<Database>,
+    table_id: web::Path<u64>,
+    req: web::Json<GetRowsRequest>,
+) -> impl Responder {
+    let table_id = table_id.into_inner();
+    let row_ids = req.row_ids.clone();
+    debug!("API: Getting {} rows from table {}", row_ids.len(), table_id);
 
     match db.read() {
-        Ok(db_guard) => {
-            match db_guard.get_row(table_id, row_id) {
-                Ok(row) => {
-                    info!("API: Row {} retrieved from table {}", row_id, table_id);
+        Ok(db_guard) => match db_guard.get_rows(table_id, row_ids.clone()) {
+            Ok(rows) => {
+                info!("API: Retrieved {} rows from table {}", rows.len(), table_id);
 
-                    // Convert CellStructure to JSON-safe format
-                    let cells: Vec<serde_json::Value> = row
-                        .into_iter()
-                        .filter_map(|cell| serde_json::to_value(cell).ok())
-                        .collect();
-
-                    HttpResponse::Ok().json(GetRowResponse {
-                        table_id,
+                let rows = row_ids
+                    .into_iter()
+                    .zip(rows.into_iter())
+                    .map(|(row_id, row)| RowResponse {
                         row_id,
-                        cells,
+                        cells: row
+                            .into_iter()
+                            .filter_map(|cell| serde_json::to_value(cell).ok())
+                            .collect(),
                     })
-                }
-                Err(e) => error_to_response(e),
+                    .collect::<Vec<_>>();
+
+                HttpResponse::Ok().json(GetRowsResponse {
+                    table_id,
+                    row_count: rows.len(),
+                    rows,
+                })
             }
-        }
+            Err(e) => error_to_response(e),
+        },
         Err(e) => handle_read_lock_error(e),
     }
 }
@@ -540,8 +559,8 @@ pub async fn update_rows(
     let updated_count = req.row_ids.len();
     debug!("API: Updating {} rows in table {}", updated_count, table_id);
 
-    match db.write() {
-        Ok(mut db_guard) => {
+    match db.read() {
+        Ok(db_guard) => {
             match db_guard.update_rows(table_id, req.row_ids.clone(), req.new_values.clone()) {
                 Ok(_) => {
                     info!("API: {} rows updated in table {}", updated_count, table_id);
@@ -554,7 +573,7 @@ pub async fn update_rows(
                 Err(e) => error_to_response(e),
             }
         }
-        Err(e) => handle_lock_error(e),
+        Err(e) => handle_read_lock_error(e),
     }
 }
 
@@ -587,7 +606,7 @@ pub async fn search_rows(
                         table_id, row_count
                     );
 
-                    // Convert CellStructure to JSON-safe format
+                    // Convert CellSchema to JSON-safe format
                     let json_rows: Vec<Vec<serde_json::Value>> = rows
                         .into_iter()
                         .map(|row| {
@@ -662,9 +681,6 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         .route("/api/tables/{table_id}/rows", web::post().to(insert_rows))
         .route("/api/tables/{table_id}/rows", web::delete().to(delete_rows))
         .route("/api/tables/{table_id}/rows", web::put().to(update_rows))
-        .route(
-            "/api/tables/{table_id}/rows/{row_id}",
-            web::get().to(get_row),
-        )
+        .route("/api/tables/{table_id}/rows/get", web::post().to(get_rows))
         .route("/api/tables/{table_id}/search", web::post().to(search_rows));
 }

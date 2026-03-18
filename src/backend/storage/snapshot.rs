@@ -43,7 +43,7 @@ pub fn read_snapshot_with_context(
 
     let mut db: InternalDatabaseSchema = from_slice(&snapshot_bytes).map_err(|e| {
         error!("Failed to deserialize snapshot: {}", e);
-        DataBaseErrors::SerializationError(e.to_string())
+        DataBaseErrors::DeserializationError(e.to_string())
     })?;
     debug!("Snapshot deserialized successfully");
 
