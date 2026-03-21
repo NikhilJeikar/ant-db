@@ -1,3 +1,4 @@
+use crate::backend::core::types::Row;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -13,10 +14,10 @@ pub enum DataBaseErrors {
     // Row-related errors
     #[error("Row with ID '{0}' not found in the table.")]
     RowNotFound(u64),
-    #[error("Multiple entries for row({0}) same column {1}")]
-    RowColumnDuplicate(u64, u64),
+    #[error("Multiple entries for row({0:?}) same column {1}")]
+    RowColumnDuplicate(Row, u64),
     #[error("Data type mismatch for column {0}: expected {1}, got {2}")]
-    DataTypeMismatch(u64, String, String),
+    DataTypeMismatch(u64, &'static str, &'static str),
 
     // Table-related errors
     #[error("Table '{0}' already exists.")]

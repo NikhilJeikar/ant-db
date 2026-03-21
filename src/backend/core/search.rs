@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::backend::schema::DecodedData;
+use crate::backend::core::types::DecodedData;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum SearchOperator {

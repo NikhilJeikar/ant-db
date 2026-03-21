@@ -1,9 +1,6 @@
-use std::collections::BTreeMap;
-
 use crate::backend::config::Config;
 use crate::backend::core::database::{DataBaseWriteAheadLog, InternalDatabaseSchema};
-use crate::backend::core::table::InternalCell;
-use crate::backend::schema::{Constraint, DataType};
+use crate::backend::core::types::{ColumnId, Constraint, DataType, Index, Row, RowId, TableId};
 use bincode::deserialize_from;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -16,46 +13,45 @@ use crate::backend::errors::DataBaseErrors;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum DataBaseOperation {
     CreateTable {
-        table_id: u64,
+        table_id: TableId,
         name: String,
     },
     DropTable {
-        table_id: u64,
+        table_id: TableId,
     },
     CreateColumn {
-        table_id: u64,
-        column_id: u64,
+        table_id: TableId,
+        column_id: ColumnId,
         name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
+        index: Option<Index>,
     },
     DropColumn {
-        table_id: u64,
-        column_id: u64,
+        table_id: TableId,
+        column_id: ColumnId,
     },
     CreateIndex {
-        table_id: u64,
-        column_id: u64,
-        index: BTreeMap<Vec<u8>, Vec<u64>>,
+        table_id: TableId,
+        column_id: ColumnId,
+        index: Index,
     },
     DropIndex {
-        table_id: u64,
-        column_id: u64,
+        table_id: TableId,
+        column_id: ColumnId,
     },
     InsertRow {
-        table_id: u64,
-        row_id: u64,
-        row: Vec<InternalCell>,
+        table_id: TableId,
+        rows: Vec<(RowId, Row)>,
     },
     DeleteRow {
-        table_id: u64,
-        row_id: u64,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
     },
-    UpdateRow {
-        table_id: u64,
-        row_id: u64,
-        cells: Vec<InternalCell>,
+    UpdateRows {
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+        row: Row,
     },
 }
 
@@ -96,14 +92,14 @@ impl WriteAheadLogManager {
     }
 
     pub fn append(&mut self, op: &DataBaseOperation) {
-        debug!("Appending operation to WAL: {:?}", op);
-        bincode::serialize_into(&mut self.writer, op)
-            .map_err(|e| debug!("Failed to serialize operation: {}", e))
-            .ok();
-        self.writer
-            .flush()
-            .map_err(|e| debug!("Failed to flush WAL: {}", e))
-            .ok();
+        if let Err(e) = bincode::serialize_into(&mut self.writer, op) {
+            error!("Failed to serialize operation: {}", e);
+            return;
+        }
+
+        if let Err(e) = self.writer.flush() {
+            error!("Failed to flush WAL writer: {}", e);
+        }
     }
 
     pub fn get_wal_size(&self) -> u64 {
@@ -187,26 +183,24 @@ fn apply_operation(
             error!("Failed to apply DropIndex operation: {}", e);
             e
         })?,
-        DataBaseOperation::InsertRow {
-            table_id,
-            row_id,
-            row,
-        } => db.wal_insert_row(table_id, row_id, row).map_err(|e| {
-            error!("Failed to apply InsertRow operation: {}", e);
-            e
-        })?,
-        DataBaseOperation::DeleteRow { table_id, row_id } => {
-            db.wal_delete_row(table_id, row_id).map_err(|e| {
+        DataBaseOperation::InsertRow { table_id, rows } => {
+            db.wal_insert_rows(table_id, rows).map_err(|e| {
+                error!("Failed to apply InsertRow operation: {}", e);
+                e
+            })?
+        }
+        DataBaseOperation::DeleteRow { table_id, row_ids } => {
+            db.wal_delete_rows(table_id, row_ids).map_err(|e| {
                 error!("Failed to apply DeleteRow operation: {}", e);
                 e
             })?
         }
-        DataBaseOperation::UpdateRow {
+        DataBaseOperation::UpdateRows {
             table_id,
-            row_id,
-            cells,
-        } => db.wal_update_row(table_id, row_id, cells).map_err(|e| {
-            error!("Failed to apply UpdateRow operation: {}", e);
+            row_ids,
+            row,
+        } => db.wal_update_rows(table_id, row_ids, row).map_err(|e| {
+            error!("Failed to apply UpdateRows operation: {}", e);
             e
         })?,
     };

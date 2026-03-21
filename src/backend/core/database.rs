@@ -1,10 +1,9 @@
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::search::{Projection, SearchCriteria, SortBy};
-use crate::backend::core::table::{
-    CellStructure, InternalCell, InternalTableSchema, TableManager, TableSchema, TableWriteAheadLog,
-};
+use crate::backend::core::table::{TableManager, TableWriteAheadLog};
+use crate::backend::core::types::{ColumnId, Constraint, DataType, Index, RowId, TableId};
+use crate::backend::core::types::{InternalTableSchema, Row, TableSchema};
 use crate::backend::errors::DataBaseErrors;
-use crate::backend::schema::{Constraint, DataType};
 use crate::backend::storage::wal::{DataBaseOperation, WriteAheadLogBase, WriteAheadLogManager};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -12,13 +11,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, error, info};
 
 fn serialize_tables<S>(
-    tables: &BTreeMap<u64, Arc<RwLock<InternalTableSchema>>>,
+    tables: &BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let export: BTreeMap<u64, InternalTableSchema> = tables
+    let export: BTreeMap<TableId, InternalTableSchema> = tables
         .iter()
         .filter_map(|(k, v)| match v.read() {
             Ok(guard) => Some((*k, guard.clone())),
@@ -36,11 +35,11 @@ where
 
 fn deserialize_tables<'de, D>(
     deserializer: D,
-) -> Result<BTreeMap<u64, Arc<RwLock<InternalTableSchema>>>, D::Error>
+) -> Result<BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let intermediate = BTreeMap::<u64, InternalTableSchema>::deserialize(deserializer)?;
+    let intermediate = BTreeMap::<TableId, InternalTableSchema>::deserialize(deserializer)?;
     Ok(intermediate
         .into_iter()
         .map(|(k, v)| (k, Arc::new(RwLock::new(v))))
@@ -53,9 +52,9 @@ pub struct InternalDatabaseSchema {
         serialize_with = "serialize_tables",
         deserialize_with = "deserialize_tables"
     )]
-    pub tables: BTreeMap<u64, Arc<RwLock<InternalTableSchema>>>,
-    pub tables_index: BTreeMap<String, u64>,
-    next_table_id: u64,
+    pub tables: BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>,
+    pub tables_index: BTreeMap<String, TableId>,
+    next_table_id: TableId,
     #[serde(skip)]
     pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
     #[serde(skip)]
@@ -63,80 +62,87 @@ pub struct InternalDatabaseSchema {
 }
 
 pub trait DataBaseManager {
-    fn create_table(&mut self, table_name: String) -> Result<u64, DataBaseErrors>;
-    fn drop_table(&mut self, table_id: u64) -> Result<(), DataBaseErrors>;
+    fn create_table(&mut self, table_name: String) -> Result<TableId, DataBaseErrors>;
+    fn drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors>;
 
-    fn get_table_id(&self, table_name: String) -> Result<u64, DataBaseErrors>;
-    fn get_table_schema(&self, table_id: u64) -> Result<TableSchema, DataBaseErrors>;
-    fn get_table_size(&self, table_id: u64) -> Result<usize, DataBaseErrors>;
+    fn get_table_id(&self, table_name: String) -> Result<TableId, DataBaseErrors>;
+    fn get_table_schema(&self, table_id: TableId) -> Result<TableSchema, DataBaseErrors>;
+    fn get_table_size(&self, table_id: TableId) -> Result<usize, DataBaseErrors>;
 
     fn list_tables(&self) -> Vec<String>;
 
     fn create_column(
-        &mut self,
-        table_id: u64,
+        &self,
+        table_id: TableId,
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-    ) -> Result<u64, DataBaseErrors>;
-    fn drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
-    fn create_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
-    fn drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
+    ) -> Result<ColumnId, DataBaseErrors>;
+    fn drop_column(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn create_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn drop_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
 
-    fn insert_rows(
-        &mut self,
-        table_id: u64,
-        rows: Vec<Vec<CellStructure>>,
-    ) -> Result<(), DataBaseErrors>;
-    fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u64>) -> Result<(), DataBaseErrors>;
+    fn insert_rows(&self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors>;
+    fn delete_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors>;
     fn update_rows(
-        &mut self,
-        table_id: u64,
-        row_ids: Vec<u64>,
-        new_values: Vec<CellStructure>,
+        &self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+        new_values: Row,
     ) -> Result<(), DataBaseErrors>;
-    fn get_row(&self, table_id: u64, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors>;
+    fn get_rows(&self, table_id: TableId, row_id: Vec<RowId>) -> Result<Vec<Row>, DataBaseErrors>;
     fn search_rows(
         &self,
-        table_id: u64,
+        table_id: TableId,
         criteria: Vec<SearchCriteria>,
         projection: Option<Projection>,
         sort_by: Option<SortBy>,
-    ) -> Result<Vec<Vec<CellStructure>>, DataBaseErrors>;
+    ) -> Result<Vec<Row>, DataBaseErrors>;
 }
 
 pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
-    fn wal_create_table(&mut self, table_id: u64, name: String) -> Result<(), DataBaseErrors>;
-    fn wal_drop_table(&mut self, table_id: u64) -> Result<(), DataBaseErrors>;
+    fn wal_create_table(&mut self, table_id: TableId, name: String) -> Result<(), DataBaseErrors>;
+    fn wal_drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors>;
     fn wal_create_column(
         &mut self,
-        table_id: u64,
-        column_id: u64,
+        table_id: TableId,
+        column_id: ColumnId,
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
+        index: Option<Index>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn wal_drop_column(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors>;
     fn wal_create_index(
         &mut self,
-        table_id: u64,
-        column_id: u64,
-        index: BTreeMap<Vec<u8>, Vec<u64>>,
+        table_id: TableId,
+        column_id: ColumnId,
+        index: Index,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors>;
-    fn wal_insert_row(
+    fn wal_drop_index(
         &mut self,
-        table_id: u64,
-        row_id: u64,
-        row: Vec<InternalCell>,
+        table_id: TableId,
+        column_id: ColumnId,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_delete_row(&mut self, table_id: u64, row_id: u64) -> Result<(), DataBaseErrors>;
-    fn wal_update_row(
+    fn wal_insert_rows(
         &mut self,
-        table_id: u64,
-        row_id: u64,
-        cells: Vec<InternalCell>,
+        table_id: TableId,
+        rows: Vec<(RowId, Row)>,
+    ) -> Result<(), DataBaseErrors>;
+    fn wal_delete_rows(
+        &mut self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+    ) -> Result<(), DataBaseErrors>;
+    fn wal_update_rows(
+        &mut self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+        row: Row,
     ) -> Result<(), DataBaseErrors>;
 }
 
@@ -202,23 +208,24 @@ impl InternalDatabaseSchema {
         }
     }
 
-    fn insert_table(&mut self, table_id: u64, table_schema: InternalTableSchema) {
+    fn insert_table(&mut self, table_id: TableId, table_schema: InternalTableSchema) {
         self.tables_index
             .insert(table_schema.name.clone(), table_id);
         self.tables
             .insert(table_id, Arc::new(RwLock::new(table_schema)));
     }
 
-    fn remove_table(&mut self, table_id: u64) {
+    fn remove_table(&mut self, table_id: TableId) {
         self.tables_index
             .retain(|_key, &mut value| value != table_id);
+        self.tables.remove(&table_id);
     }
 }
 
 impl DataBaseWriteAheadLog for InternalDatabaseSchema {
     fn wal_create_table(
         &mut self,
-        table_id: u64,
+        table_id: TableId,
         table_name: String,
     ) -> Result<(), DataBaseErrors> {
         if self.tables_index.iter().any(|t| *t.0 == table_name) {
@@ -236,18 +243,18 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         Ok(())
     }
 
-    fn wal_drop_table(&mut self, table_id: u64) -> Result<(), DataBaseErrors> {
+    fn wal_drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors> {
         self.drop_table(table_id)
     }
 
     fn wal_create_column(
         &mut self,
-        table_id: u64,
-        column_id: u64,
+        table_id: TableId,
+        column_id: ColumnId,
         column_name: String,
-        data_type: crate::backend::schema::DataType,
-        constraints: Vec<crate::backend::schema::Constraint>,
-        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
+        data_type: DataType,
+        constraints: Vec<Constraint>,
+        index: Option<Index>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -261,7 +268,11 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn wal_drop_column(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_drop_column(column_id),
@@ -270,9 +281,9 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
 
     fn wal_create_index(
         &mut self,
-        table_id: u64,
-        column_id: u64,
-        index: BTreeMap<Vec<u8>, Vec<u64>>,
+        table_id: TableId,
+        column_id: ColumnId,
+        index: Index,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -280,47 +291,54 @@ impl DataBaseWriteAheadLog for InternalDatabaseSchema {
         }
     }
 
-    fn wal_drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn wal_drop_index(
+        &mut self,
+        table_id: TableId,
+        column_id: ColumnId,
+    ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
             Some(i) => i.write().unwrap().wal_drop_index(column_id),
         }
     }
 
-    fn wal_insert_row(
+    fn wal_insert_rows(
         &mut self,
-        table_id: u64,
-        row_id: u64,
-        row: Vec<InternalCell>,
+        table_id: TableId,
+        rows: Vec<(RowId, Row)>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_insert_row(row_id, row),
+            Some(i) => i.write().unwrap().wal_insert_rows(rows),
         }
     }
 
-    fn wal_delete_row(&mut self, table_id: u64, row_id: u64) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_delete_row(row_id),
-        }
-    }
-
-    fn wal_update_row(
+    fn wal_delete_rows(
         &mut self,
-        table_id: u64,
-        row_id: u64,
-        cells: Vec<InternalCell>,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
     ) -> Result<(), DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_update_row(row_id, cells),
+            Some(i) => i.write().unwrap().wal_delete_rows(row_ids),
+        }
+    }
+
+    fn wal_update_rows(
+        &mut self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+        row: Row,
+    ) -> Result<(), DataBaseErrors> {
+        match self.tables.get(&table_id) {
+            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
+            Some(i) => i.write().unwrap().wal_update_rows(row_ids, row),
         }
     }
 }
 
 impl DataBaseManager for InternalDatabaseSchema {
-    fn create_table(&mut self, table_name: String) -> Result<u64, DataBaseErrors> {
+    fn create_table(&mut self, table_name: String) -> Result<TableId, DataBaseErrors> {
         info!("Creating table '{}'", table_name);
         if self.tables_index.iter().any(|t| *t.0 == table_name) {
             error!("Table '{}' already exists", table_name);
@@ -353,7 +371,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         Ok(table_id)
     }
 
-    fn drop_table(&mut self, table_id: u64) -> Result<(), DataBaseErrors> {
+    fn drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors> {
         info!("Dropping table {}", table_id);
         if !self.tables.contains_key(&table_id) {
             error!("Table not found: {}", table_id);
@@ -366,7 +384,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         Ok(())
     }
 
-    fn get_table_id(&self, table_name: String) -> Result<u64, DataBaseErrors> {
+    fn get_table_id(&self, table_name: String) -> Result<TableId, DataBaseErrors> {
         debug!("geting table if for {table_name}");
         match self.tables_index.get(&table_name) {
             None => Err(DataBaseErrors::TableNotFound(table_name)),
@@ -374,7 +392,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn get_table_schema(&self, table_id: u64) -> Result<TableSchema, DataBaseErrors> {
+    fn get_table_schema(&self, table_id: TableId) -> Result<TableSchema, DataBaseErrors> {
         debug!("getting table schema for {table_id}");
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -388,7 +406,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn get_table_size(&self, table_id: u64) -> Result<usize, DataBaseErrors> {
+    fn get_table_size(&self, table_id: TableId) -> Result<usize, DataBaseErrors> {
         debug!("getting table size for {table_id}");
         match self.tables.get(&table_id) {
             None => Err(DataBaseErrors::TableIDNotFound(table_id)),
@@ -411,12 +429,12 @@ impl DataBaseManager for InternalDatabaseSchema {
     }
 
     fn create_column(
-        &mut self,
-        table_id: u64,
+        &self,
+        table_id: TableId,
         column_name: String,
-        data_type: crate::backend::schema::DataType,
-        constraints: Vec<crate::backend::schema::Constraint>,
-    ) -> Result<u64, DataBaseErrors> {
+        data_type: DataType,
+        constraints: Vec<Constraint>,
+    ) -> Result<ColumnId, DataBaseErrors> {
         debug!("Creating column '{}' in table {}", column_name, table_id);
         match self.tables.get(&table_id) {
             None => {
@@ -447,7 +465,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn drop_column(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn drop_column(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         debug!("Dropping column {} from table {}", column_id, table_id);
         match self.tables.get(&table_id) {
             None => {
@@ -474,7 +492,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn create_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn create_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         debug!(
             "Creating index for column {} in table {}",
             column_id, table_id
@@ -509,7 +527,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn drop_index(&mut self, table_id: u64, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn drop_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         debug!(
             "Dropping index for column {} in table {}",
             column_id, table_id
@@ -544,11 +562,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn insert_rows(
-        &mut self,
-        table_id: u64,
-        rows: Vec<Vec<CellStructure>>,
-    ) -> Result<(), DataBaseErrors> {
+    fn insert_rows(&self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors> {
         let row_count = rows.len();
         debug!("Inserting {} rows into table {}", row_count, table_id);
         match self.tables.get(&table_id) {
@@ -563,12 +577,23 @@ impl DataBaseManager for InternalDatabaseSchema {
                 );
                 match i.write() {
                     Ok(mut guard) => {
-                        let result = guard.insert_rows(rows);
+                        let start_row_id = guard.next_row_id;
+                        let processed_rows = guard.pre_insert_rows(&rows, start_row_id);
+                        match &processed_rows {
+                            Ok(_) => info!("Successfully computed rows"),
+                            Err(e) => error!("Failed computing rows: {}", e),
+                        }
+                        let processed_rows = processed_rows?;
+
+                        let result = guard.insert_rows(processed_rows);
                         match &result {
-                            Ok(_) => info!(
-                                "Successfully inserted {} rows into table {}",
-                                row_count, table_id
-                            ),
+                            Ok(_) => {
+                                guard.next_row_id += row_count as u64;
+                                info!(
+                                    "Successfully inserted {} rows into table {}",
+                                    row_count, table_id
+                                )
+                            }
                             Err(e) => error!(
                                 "Failed to insert {} rows into table {}: {}",
                                 row_count, table_id, e
@@ -585,7 +610,7 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn delete_rows(&mut self, table_id: u64, row_ids: Vec<u64>) -> Result<(), DataBaseErrors> {
+    fn delete_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
         let row_count = row_ids.len();
         debug!(
             "Deleting {} rows from table {}: {:?}",
@@ -596,13 +621,27 @@ impl DataBaseManager for InternalDatabaseSchema {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
             }
-            Some(i) => {
+            Some(table_arc) => {
                 debug!(
                     "Acquiring write lock for table {} to delete {} rows",
                     table_id, row_count
                 );
-                match i.write() {
+
+                match table_arc.write() {
                     Ok(mut guard) => {
+                        let validation = guard.pre_delete_rows(&row_ids);
+                        match &validation {
+                            Ok(_) => info!(
+                                "Successfully computed rows to delete from table {}",
+                                table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to compute rows to delete from table {}: {}",
+                                table_id, e
+                            ),
+                        }
+                        validation?;
+
                         let result = guard.delete_rows(row_ids);
                         match &result {
                             Ok(_) => info!(
@@ -626,28 +665,39 @@ impl DataBaseManager for InternalDatabaseSchema {
     }
 
     fn update_rows(
-        &mut self,
-        table_id: u64,
-        row_ids: Vec<u64>,
-        new_values: Vec<CellStructure>,
+        &self,
+        table_id: TableId,
+        row_ids: Vec<RowId>,
+        new_values: Row,
     ) -> Result<(), DataBaseErrors> {
+        info!("Updating the rows for {}", table_id);
         let row_count = row_ids.len();
-        debug!(
-            "Updating {} rows in table {}: {:?}",
-            row_count, table_id, row_ids
-        );
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
             }
-            Some(i) => {
+            Some(db_arc) => {
                 debug!(
                     "Acquiring write lock for table {} to update {} rows",
                     table_id, row_count
                 );
-                match i.write() {
+
+                match db_arc.write() {
                     Ok(mut guard) => {
+                        let validation_result = guard.pre_update_rows(&row_ids, &new_values);
+                        match &validation_result {
+                            Ok(_) => info!(
+                                "Successfully validated rows to update in table {}",
+                                table_id
+                            ),
+                            Err(e) => error!(
+                                "Failed to validate rows to update in table {}: {}",
+                                table_id, e
+                            ),
+                        }
+                        validation_result?;
+
                         let result = guard.update_rows(row_ids, new_values);
                         match &result {
                             Ok(_) => info!(
@@ -670,51 +720,38 @@ impl DataBaseManager for InternalDatabaseSchema {
         }
     }
 
-    fn get_row(&self, table_id: u64, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors> {
-        debug!("Fetching row {} from table {}", row_id, table_id);
+    fn get_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<Vec<Row>, DataBaseErrors> {
         match self.tables.get(&table_id) {
             None => {
                 error!("Table not found: {}", table_id);
                 Err(DataBaseErrors::TableIDNotFound(table_id))
             }
-            Some(i) => {
-                debug!(
-                    "Acquiring read lock for table {} to fetch row {}",
-                    table_id, row_id
-                );
-                match i.read() {
-                    Ok(guard) => {
-                        let result = guard.get_row(row_id);
-                        match &result {
-                            Ok(row) => debug!(
-                                "Row {} retrieved from table {} with {} cells",
-                                row_id,
-                                table_id,
-                                row.len()
-                            ),
-                            Err(e) => error!(
-                                "Failed to fetch row {} from table {}: {}",
-                                row_id, table_id, e
-                            ),
+            Some(db_arc) => match db_arc.read() {
+                Ok(guard) => {
+                    let result = guard.get_rows(&row_ids);
+                    match &result {
+                        Ok(rows) => {
+                            debug!("Rows({}) retrieved from table {}", rows.len(), table_id)
                         }
-                        result
+                        Err(e) => error!("Failed to fetch rows from table {}: {}", table_id, e),
                     }
-                    Err(e) => {
-                        error!("Failed to acquire read lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
+                    result
                 }
-            }
+                Err(e) => {
+                    error!("Failed to acquire read lock for table {}: {}", table_id, e);
+                    Err(DataBaseErrors::WalLockError)
+                }
+            },
         }
     }
 
     fn search_rows(
         &self,
-        table_id: u64,
+        table_id: TableId,
         criteria: Vec<SearchCriteria>,
         projection: Option<Projection>,
         sort_by: Option<SortBy>,
-    ) -> Result<Vec<Vec<CellStructure>>, DataBaseErrors> {
+    ) -> Result<Vec<Row>, DataBaseErrors> {
         debug!(
             "Searching table {} with {} criteria, projection: {}, sort_by: {}",
             table_id,

@@ -1,56 +1,16 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::search::{OrderBy, Projection, SearchCriteria, SearchOperator, SortBy};
+use crate::backend::core::types::{
+    ColumnId, ColumnSchema, Constraint, DataType, DecodedData, Index, InternalTableSchema, Row,
+    RowId, TableId, TableSchema,
+};
 use crate::backend::errors::DataBaseErrors;
-use crate::backend::schema::{Constraint, DataType, DecodedData};
 use crate::backend::storage::wal::{DataBaseOperation, WriteAheadLogBase, WriteAheadLogManager};
-use rmp_serde::{from_slice, to_vec};
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{error, info};
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CellStructure {
-    pub column_id: u64,
-    pub data: DecodedData,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ColumnSchema {
-    pub name: String,
-    pub data_type: DataType,
-    pub constraints: Vec<Constraint>,
-    pub index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TableSchema {
-    pub name: String,
-    pub columns: Vec<ColumnSchema>,
-}
-
-// Internal structures for efficient storage and retrieval
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct InternalCell {
-    pub column_id: u64,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct InternalTableSchema {
-    pub table_id: u64,
-    pub name: String,
-    pub columns: BTreeMap<u64, ColumnSchema>,
-    pub rows: BTreeMap<u64, Vec<InternalCell>>,
-    pub next_row_id: u64,
-    pub next_column_id: u64,
-
-    #[serde(skip)]
-    pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
-    #[serde(skip)]
-    pub wal_manager: Arc<Mutex<WriteAheadLogManager>>,
-}
 
 pub trait TableManager {
     fn create_column(
@@ -58,27 +18,30 @@ pub trait TableManager {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-    ) -> Result<u64, DataBaseErrors>;
-    fn drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
+    ) -> Result<ColumnId, DataBaseErrors>;
+    fn drop_column(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
 
-    fn create_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
-    fn drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
+    fn create_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn drop_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
 
-    fn insert_rows(&mut self, rows: Vec<Vec<CellStructure>>) -> Result<(), DataBaseErrors>;
-    fn delete_rows(&mut self, row_ids: Vec<u64>) -> Result<(), DataBaseErrors>;
-    fn update_rows(
-        &mut self,
-        row_ids: Vec<u64>,
-        new_values: Vec<CellStructure>,
-    ) -> Result<(), DataBaseErrors>;
+    fn pre_insert_rows(
+        &self,
+        rows: &[Row],
+        start_row_id: RowId,
+    ) -> Result<Vec<(RowId, Row)>, DataBaseErrors>;
+    fn insert_rows(&mut self, rows: Vec<(RowId, Row)>) -> Result<(), DataBaseErrors>;
+    fn pre_delete_rows(&self, row_ids: &Vec<RowId>) -> Result<(), DataBaseErrors>;
+    fn delete_rows(&mut self, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors>;
+    fn pre_update_rows(&self, row_ids: &Vec<RowId>, row: &Row) -> Result<(), DataBaseErrors>;
+    fn update_rows(&mut self, row_ids: Vec<RowId>, row: Row) -> Result<(), DataBaseErrors>;
 
-    fn get_row(&self, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors>;
+    fn get_rows(&self, row_ids: &Vec<RowId>) -> Result<Vec<Row>, DataBaseErrors>;
     fn find_row(
         &self,
         search_criteria: Vec<SearchCriteria>,
         projection: Option<Projection>,
         sort_by: Option<SortBy>,
-    ) -> Result<Vec<Vec<CellStructure>>, DataBaseErrors>;
+    ) -> Result<Vec<Row>, DataBaseErrors>;
 
     fn get_size(&self) -> usize;
     fn get_schema(&self) -> Result<TableSchema, DataBaseErrors>;
@@ -87,32 +50,25 @@ pub trait TableWriteAheadLog: WriteAheadLogBase {
     // replay operations for WAL recovery
     fn wal_create_column(
         &mut self,
-        column_id: u64,
+        column_id: ColumnId,
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
+        index: Option<Index>,
     ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
-    fn wal_create_index(
-        &mut self,
-        column_id: u64,
-        index: BTreeMap<Vec<u8>, Vec<u64>>,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors>;
-    fn wal_insert_row(&mut self, row_id: u64, row: Vec<InternalCell>)
+    fn wal_drop_column(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+    fn wal_create_index(&mut self, column_id: ColumnId, index: Index)
     -> Result<(), DataBaseErrors>;
-    fn wal_delete_row(&mut self, row_id: u64) -> Result<(), DataBaseErrors>;
-    fn wal_update_row(
-        &mut self,
-        row_id: u64,
-        cells: Vec<InternalCell>,
-    ) -> Result<(), DataBaseErrors>;
+    fn wal_drop_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors>;
+
+    fn wal_insert_rows(&mut self, rows: Vec<(RowId, Row)>) -> Result<(), DataBaseErrors>;
+    fn wal_delete_rows(&mut self, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors>;
+    fn wal_update_rows(&mut self, row_ids: Vec<RowId>, row: Row) -> Result<(), DataBaseErrors>;
 }
 
 impl InternalTableSchema {
     pub fn new(
-        table_id: u64,
+        table_id: TableId,
         name: String,
         internal_state_manager: Arc<RwLock<InternalStateManager>>,
         wal_manager: Arc<Mutex<WriteAheadLogManager>>,
@@ -138,16 +94,8 @@ impl InternalTableSchema {
         self.wal_manager = wal_manager;
     }
 
-    fn encode_cell(value: &DecodedData) -> Result<Vec<u8>, DataBaseErrors> {
-        to_vec(value).map_err(|e| DataBaseErrors::SerializationError(e.to_string()))
-    }
-
-    fn decode_cell(bytes: &[u8]) -> Result<DecodedData, DataBaseErrors> {
-        from_slice(bytes).map_err(|e| DataBaseErrors::DeserializationError(e.to_string()))
-    }
-
-    fn duplicate_cells(cells: &Vec<InternalCell>) -> Option<u64> {
-        let mut present_columns: HashSet<u64> = HashSet::new();
+    fn duplicate_cells(cells: &Row) -> Option<ColumnId> {
+        let mut present_columns: HashSet<ColumnId> = HashSet::new();
         for cell in cells {
             if present_columns.contains(&cell.column_id) {
                 return Some(cell.column_id);
@@ -158,64 +106,7 @@ impl InternalTableSchema {
     }
 
     fn validate_data_type(data: &DecodedData, expected_type: &DataType) -> bool {
-        match (data, expected_type) {
-            (DecodedData::IntegerU8(_), DataType::IntegerU8) => true,
-            (DecodedData::IntegerU16(_), DataType::IntegerU16) => true,
-            (DecodedData::IntegerU32(_), DataType::IntegerU32) => true,
-            (DecodedData::IntegerU64(_), DataType::IntegerU64) => true,
-            (DecodedData::IntegerU128(_), DataType::IntegerU128) => true,
-            (DecodedData::IntegerI8(_), DataType::IntegerI8) => true,
-            (DecodedData::IntegerI16(_), DataType::IntegerI16) => true,
-            (DecodedData::IntegerI32(_), DataType::IntegerI32) => true,
-            (DecodedData::IntegerI64(_), DataType::IntegerI64) => true,
-            (DecodedData::IntegerI128(_), DataType::IntegerI128) => true,
-            (DecodedData::FloatF32(_), DataType::FloatF32) => true,
-            (DecodedData::FloatF64(_), DataType::FloatF64) => true,
-            (DecodedData::String(_), DataType::String) => true,
-            (DecodedData::Boolean(_), DataType::Boolean) => true,
-            (DecodedData::Bytes(_), DataType::Bytes) => true,
-            _ => false,
-        }
-    }
-
-    fn get_data_type_name(data: &DecodedData) -> &'static str {
-        match data {
-            DecodedData::IntegerU8(_) => "IntegerU8",
-            DecodedData::IntegerU16(_) => "IntegerU16",
-            DecodedData::IntegerU32(_) => "IntegerU32",
-            DecodedData::IntegerU64(_) => "IntegerU64",
-            DecodedData::IntegerU128(_) => "IntegerU128",
-            DecodedData::IntegerI8(_) => "IntegerI8",
-            DecodedData::IntegerI16(_) => "IntegerI16",
-            DecodedData::IntegerI32(_) => "IntegerI32",
-            DecodedData::IntegerI64(_) => "IntegerI64",
-            DecodedData::IntegerI128(_) => "IntegerI128",
-            DecodedData::FloatF32(_) => "FloatF32",
-            DecodedData::FloatF64(_) => "FloatF64",
-            DecodedData::String(_) => "String",
-            DecodedData::Boolean(_) => "Boolean",
-            DecodedData::Bytes(_) => "Bytes",
-        }
-    }
-
-    fn get_expected_type_name(data_type: &DataType) -> &'static str {
-        match data_type {
-            DataType::IntegerU8 => "IntegerU8",
-            DataType::IntegerU16 => "IntegerU16",
-            DataType::IntegerU32 => "IntegerU32",
-            DataType::IntegerU64 => "IntegerU64",
-            DataType::IntegerU128 => "IntegerU128",
-            DataType::IntegerI8 => "IntegerI8",
-            DataType::IntegerI16 => "IntegerI16",
-            DataType::IntegerI32 => "IntegerI32",
-            DataType::IntegerI64 => "IntegerI64",
-            DataType::IntegerI128 => "IntegerI128",
-            DataType::FloatF32 => "FloatF32",
-            DataType::FloatF64 => "FloatF64",
-            DataType::String => "String",
-            DataType::Boolean => "Boolean",
-            DataType::Bytes => "Bytes",
-        }
+        &data.data_type() == expected_type
     }
 
     fn should_create_index(constraints: &Vec<Constraint>) -> bool {
@@ -224,11 +115,11 @@ impl InternalTableSchema {
             .any(|c| matches!(c, Constraint::Unique | Constraint::PrimaryKey))
     }
 
-    fn internal_insert_column(&mut self, column_id: u64, column_schema: ColumnSchema) {
+    fn internal_insert_column(&mut self, column_id: ColumnId, column_schema: ColumnSchema) {
         self.columns.insert(column_id, column_schema);
     }
 
-    fn internal_drop_column(&mut self, column_id: u64) {
+    fn internal_drop_column(&mut self, column_id: ColumnId) {
         self.columns.remove(&column_id);
 
         for row in self.rows.values_mut() {
@@ -238,26 +129,17 @@ impl InternalTableSchema {
         }
     }
 
-    fn build_index_for_column(
-        &self,
-        column_id: u64,
-    ) -> Result<BTreeMap<Vec<u8>, Vec<u64>>, DataBaseErrors> {
+    fn build_index_for_column(&self, column_id: ColumnId) -> Result<Index, DataBaseErrors> {
         if !self.columns.contains_key(&column_id) {
             return Err(DataBaseErrors::ColumnNotFound(column_id));
         }
 
-        let mut new_index: BTreeMap<Vec<u8>, Vec<u64>> = BTreeMap::new();
+        let mut new_index = Index::new();
 
         for (row_id, cells) in self.rows.iter() {
             if let Some(cell) = cells.iter().find(|c| c.column_id == column_id) {
-                match new_index.get_mut(&cell.data) {
-                    Some(ids) => {
-                        ids.push(*row_id);
-                    }
-                    None => {
-                        new_index.insert(cell.data.clone(), vec![*row_id]);
-                    }
-                };
+                let key = cell.get_key();
+                new_index.entry(key).or_default().insert(*row_id);
             }
         }
 
@@ -271,8 +153,8 @@ impl InternalTableSchema {
 
     fn apply_index_to_column(
         &mut self,
-        column_id: u64,
-        index: BTreeMap<Vec<u8>, Vec<u64>>,
+        column_id: ColumnId,
+        index: Index,
     ) -> Result<(), DataBaseErrors> {
         let column = self
             .columns
@@ -289,112 +171,118 @@ impl InternalTableSchema {
         Ok(())
     }
 
-    fn internal_insert_row(
-        &mut self,
-        row_id: u64,
-        row: Vec<InternalCell>,
-    ) -> Result<(), DataBaseErrors> {
-        if let Some(col) = Self::duplicate_cells(&row) {
-            return Err(DataBaseErrors::RowColumnDuplicate(row_id, col));
-        }
-
-        for cell in &row {
-            let column = match self.columns.get_mut(&cell.column_id) {
-                Some(c) => c,
-                None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
-            };
-
-            if let Some(ref mut index) = column.index {
-                match index.get_mut(&cell.data) {
-                    Some(ids) => {
-                        ids.push(row_id);
-                    }
-                    None => {
-                        index.insert(cell.data.clone(), vec![row_id]);
-                    }
-                };
-            }
-        }
-
-        self.rows.insert(row_id, row);
-
-        Ok(())
-    }
-
-    fn internal_delete_row(&mut self, row_id: u64) -> Result<(), DataBaseErrors> {
-        let row = self
-            .rows
-            .remove(&row_id)
-            .ok_or(DataBaseErrors::RowNotFound(row_id))?;
-
-        for cell in &row {
+    fn add_row_to_indexes(&mut self, row_id: RowId, row: &Row) -> Result<(), DataBaseErrors> {
+        for cell in row {
             let column = self
                 .columns
                 .get_mut(&cell.column_id)
                 .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
 
-            if let Some(ref mut index) = column.index {
-                if cell.data.len() == 1 {
-                    index.remove(&cell.data);
-                } else {
-                    if let Some(ids) = index.get_mut(&cell.data) {
-                        ids.retain(|id| *id != row_id);
+            if let Some(index) = column.index.as_mut() {
+                index.entry(cell.get_key()).or_default().insert(row_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn remove_row_from_indexes(&mut self, row_id: RowId, row: &Row) -> Result<(), DataBaseErrors> {
+        for cell in row {
+            let column = self
+                .columns
+                .get_mut(&cell.column_id)
+                .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
+
+            if let Some(index) = column.index.as_mut() {
+                let key = cell.get_key();
+                if let Entry::Occupied(mut entry) = index.entry(key) {
+                    let ids = entry.get_mut();
+                    ids.remove(&row_id);
+                    if ids.is_empty() {
+                        entry.remove();
                     }
                 }
             }
         }
 
-        self.rows.remove(&row_id);
+        Ok(())
+    }
+
+    fn apply_row_update(&mut self, row_id: RowId, row: &Row) -> Result<(), DataBaseErrors> {
+        let existing_row = self
+            .rows
+            .remove(&row_id)
+            .ok_or(DataBaseErrors::RowNotFound(row_id))?;
+
+        if let Err(err) = self.remove_row_from_indexes(row_id, &existing_row) {
+            let _ = self.add_row_to_indexes(row_id, &existing_row);
+            self.rows.insert(row_id, existing_row);
+            return Err(err);
+        }
+
+        if let Err(err) = self.add_row_to_indexes(row_id, row) {
+            let _ = self.remove_row_from_indexes(row_id, row);
+            let _ = self.add_row_to_indexes(row_id, &existing_row);
+            self.rows.insert(row_id, existing_row);
+            return Err(err);
+        }
+
+        self.rows.insert(row_id, row.clone());
 
         Ok(())
     }
 
-    fn internal_update_row(
-        &mut self,
-        row_id: u64,
-        row: Vec<InternalCell>,
-    ) -> Result<(), DataBaseErrors> {
-        if let Some(col) = Self::duplicate_cells(&row) {
-            return Err(DataBaseErrors::RowColumnDuplicate(row_id, col));
-        }
+    fn indexed_row_candidates(
+        &self,
+        search_criterias: &[SearchCriteria],
+    ) -> Option<BTreeSet<RowId>> {
+        let mut candidates: Option<BTreeSet<RowId>> = None;
 
-        let prev_row = self
-            .rows
-            .get(&row_id)
-            .ok_or(DataBaseErrors::RowNotFound(row_id))?
-            .clone();
+        for criteria in search_criterias {
+            if !matches!(criteria.operator, SearchOperator::Equal) {
+                continue;
+            }
 
-        for cell in &prev_row {
-            let column = match self.columns.get_mut(&cell.column_id) {
-                Some(c) => c,
-                None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
+            let Some(column) = self.columns.get(&criteria.column_id) else {
+                continue;
             };
-            if let Some(ref mut index) = column.index {
-                index.remove(&cell.data);
+            let Some(index) = column.index.as_ref() else {
+                continue;
+            };
+
+            let bucket = index
+                .get(&criteria.value.hash_key())
+                .cloned()
+                .unwrap_or_default();
+
+            match candidates.as_mut() {
+                Some(existing) => {
+                    existing.retain(|row_id| bucket.contains(row_id));
+                    if existing.is_empty() {
+                        break;
+                    }
+                }
+                None => candidates = Some(bucket),
             }
         }
 
-        for cell in &row {
-            let column = match self.columns.get_mut(&cell.column_id) {
-                Some(c) => c,
-                None => return Err(DataBaseErrors::ColumnNotFound(cell.column_id)),
-            };
+        candidates
+    }
 
-            if let Some(ref mut index) = column.index {
-                match index.get_mut(&cell.data) {
-                    Some(ids) => {
-                        ids.push(row_id);
-                    }
-                    None => {
-                        index.insert(cell.data.clone(), vec![row_id]);
-                    }
-                };
-            }
-        }
-
-        self.rows.insert(row_id, row);
-
-        Ok(())
+    fn row_matches_criteria(row: &Row, search_criterias: &[SearchCriteria]) -> bool {
+        search_criterias.iter().all(|criteria| {
+            row.iter()
+                .find(|cell| cell.column_id == criteria.column_id)
+                .map(|cell| match criteria.operator {
+                    SearchOperator::Equal => cell.data == criteria.value,
+                    SearchOperator::NotEqual => cell.data != criteria.value,
+                    SearchOperator::GreaterThan => cell.data > criteria.value,
+                    SearchOperator::LessThan => cell.data < criteria.value,
+                    SearchOperator::GreaterThanOrEqual => cell.data >= criteria.value,
+                    SearchOperator::LessThanOrEqual => cell.data <= criteria.value,
+                })
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -412,7 +300,6 @@ impl WriteAheadLogBase for InternalTableSchema {
             .unwrap_or(false);
 
         if !is_replaying {
-            info!("Writing to WAL {:?}", operation);
             wal.append(&operation);
         }
         Ok(())
@@ -425,7 +312,7 @@ impl TableManager for InternalTableSchema {
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-    ) -> Result<u64, DataBaseErrors> {
+    ) -> Result<ColumnId, DataBaseErrors> {
         if self.columns.iter().any(|c| c.1.name == column_name) {
             return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
         }
@@ -436,7 +323,7 @@ impl TableManager for InternalTableSchema {
         // Only create index if column has Unique or PrimaryKey constraint
         let index = if Self::should_create_index(&constraints) {
             info!("Creating index for column {} with constraints", column_id);
-            Some(BTreeMap::new())
+            Some(Index::new())
         } else {
             info!(
                 "Column {} created without index (no Unique/PrimaryKey constraint)",
@@ -466,7 +353,7 @@ impl TableManager for InternalTableSchema {
         Ok(column_id)
     }
 
-    fn drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn drop_column(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         if !self.columns.contains_key(&column_id) {
             return Err(DataBaseErrors::ColumnNotFound(column_id));
         }
@@ -481,7 +368,7 @@ impl TableManager for InternalTableSchema {
         Ok(())
     }
 
-    fn create_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn create_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         // Validate column exists
         if !self.columns.contains_key(&column_id) {
             return Err(DataBaseErrors::ColumnNotFound(column_id));
@@ -514,7 +401,7 @@ impl TableManager for InternalTableSchema {
         Ok(())
     }
 
-    fn drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+    fn drop_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         // Validate column exists
         if !self.columns.contains_key(&column_id) {
             return Err(DataBaseErrors::ColumnNotFound(column_id));
@@ -547,84 +434,119 @@ impl TableManager for InternalTableSchema {
         Ok(())
     }
 
-    fn insert_rows(&mut self, rows: Vec<Vec<CellStructure>>) -> Result<(), DataBaseErrors> {
+    fn pre_insert_rows(
+        &self,
+        rows: &[Row],
+        mut start_row_id: RowId,
+    ) -> Result<Vec<(RowId, Row)>, DataBaseErrors> {
+        let mut processed_rows = Vec::with_capacity(rows.len());
+
+        info!("Pre-insert rows is called");
         for row in rows {
-            let mut cells = Vec::with_capacity(row.len());
+            if let Some(dup_col) = Self::duplicate_cells(row) {
+                return Err(DataBaseErrors::RowColumnDuplicate(row.clone(), dup_col));
+            }
 
-            let row_id = self.next_row_id;
-            self.next_row_id += 1;
-
-            // Validate data types for all cells in the row
-            for v in row.iter() {
+            for cell in row {
                 let column = self
                     .columns
-                    .get(&v.column_id)
-                    .ok_or(DataBaseErrors::ColumnNotFound(v.column_id))?;
+                    .get(&cell.column_id)
+                    .ok_or(DataBaseErrors::ColumnNotFound(cell.column_id))?;
 
-                if !Self::validate_data_type(&v.data, &column.data_type) {
+                if !Self::validate_data_type(&cell.data, &column.data_type) {
                     return Err(DataBaseErrors::DataTypeMismatch(
-                        v.column_id,
-                        Self::get_expected_type_name(&column.data_type).to_string(),
-                        Self::get_data_type_name(&v.data).to_string(),
+                        cell.column_id,
+                        column.data_type.type_name(),
+                        cell.data.type_name(),
                     ));
                 }
             }
 
-            // Encode cells after validation
-            for v in row.iter() {
-                cells.push(InternalCell {
-                    column_id: v.column_id,
-                    data: Self::encode_cell(&v.data)?,
-                });
+            processed_rows.push((start_row_id, row.clone()));
+            start_row_id += 1;
+        }
+
+        Ok(processed_rows)
+    }
+
+    fn insert_rows(&mut self, rows: Vec<(RowId, Row)>) -> Result<(), DataBaseErrors> {
+        // Step 1: Accumulate row_ids per column/data
+        info!("Insert row is called");
+        let mut index_updates: BTreeMap<ColumnId, Index> = BTreeMap::new();
+
+        for (row_id, row) in &rows {
+            for cell in row {
+                index_updates
+                    .entry(cell.column_id)
+                    .or_insert_with(BTreeMap::new)
+                    .entry(cell.get_key())
+                    .or_default()
+                    .insert(*row_id);
             }
+        }
 
-            self.log_operation(DataBaseOperation::InsertRow {
-                table_id: self.table_id,
-                row_id,
-                row: cells.clone(),
-            })?;
+        // Step 2: Log operation to WAL before applying changes
+        info!("Logging operation for {} rows", rows.len());
+        self.log_operation(DataBaseOperation::InsertRow {
+            table_id: self.table_id,
+            rows: rows.clone(),
+        })?;
 
-            let _ = match self.internal_insert_row(row_id, cells) {
-                Ok(_) => continue,
-                Err(e) => return Err(e),
-            };
+        // Step 3: Apply accumulated updates to column indexes
+        for (col_id, data_map) in index_updates {
+            if let Some(column) = self.columns.get_mut(&col_id) {
+                if let Some(index) = column.index.as_mut() {
+                    for (data, ids) in data_map {
+                        index.entry(data).or_default().extend(ids);
+                    }
+                }
+            }
+        }
+
+        // Step 4: Insert all rows into self.rows
+        self.rows.extend(rows);
+        Ok(())
+    }
+
+    fn pre_delete_rows(&self, row_ids: &Vec<RowId>) -> Result<(), DataBaseErrors> {
+        for row_id in row_ids {
+            if !self.rows.contains_key(row_id) {
+                return Err(DataBaseErrors::RowNotFound(*row_id));
+            }
         }
         Ok(())
     }
 
-    fn delete_rows(&mut self, row_ids: Vec<u64>) -> Result<(), DataBaseErrors> {
-        for row_id in &row_ids {
-            if !self.rows.iter().any(|r| *r.0 == *row_id) {
-                return Err(DataBaseErrors::RowNotFound(*row_id));
-            }
-        }
-        for row_id in &row_ids {
-            self.log_operation(DataBaseOperation::DeleteRow {
-                table_id: self.table_id,
-                row_id: *row_id,
-            })?;
+    fn delete_rows(&mut self, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
+        info!("Delete rows is called for {} rows", row_ids.len());
+        self.log_operation(DataBaseOperation::DeleteRow {
+            table_id: self.table_id,
+            row_ids: row_ids.clone(),
+        })?;
 
-            let _ = match self.internal_delete_row(*row_id) {
-                Ok(_) => continue,
-                Err(e) => return Err(e),
-            };
+        for row_id in &row_ids {
+            let row = self
+                .rows
+                .remove(&row_id)
+                .ok_or(DataBaseErrors::RowNotFound(*row_id))?;
+
+            self.remove_row_from_indexes(*row_id, &row)?;
         }
         Ok(())
     }
 
-    fn update_rows(
-        &mut self,
-        row_ids: Vec<u64>,
-        new_values: Vec<CellStructure>,
-    ) -> Result<(), DataBaseErrors> {
-        for row_id in &row_ids {
-            if !self.rows.iter().any(|r| *r.0 == *row_id) {
+    fn pre_update_rows(&self, row_ids: &Vec<RowId>, row: &Row) -> Result<(), DataBaseErrors> {
+        if let Some(dup_col) = Self::duplicate_cells(row) {
+            return Err(DataBaseErrors::RowColumnDuplicate(row.clone(), dup_col));
+        }
+
+        for row_id in row_ids {
+            if !self.rows.contains_key(row_id) {
                 return Err(DataBaseErrors::RowNotFound(*row_id));
             }
         }
 
-        // Validate data types for all cells
-        for cell in new_values.iter() {
+        for cell in row {
             let column = self
                 .columns
                 .get(&cell.column_id)
@@ -633,33 +555,28 @@ impl TableManager for InternalTableSchema {
             if !Self::validate_data_type(&cell.data, &column.data_type) {
                 return Err(DataBaseErrors::DataTypeMismatch(
                     cell.column_id,
-                    Self::get_expected_type_name(&column.data_type).to_string(),
-                    Self::get_data_type_name(&cell.data).to_string(),
+                    column.data_type.type_name(),
+                    cell.data.type_name(),
                 ));
             }
         }
 
-        let mut cells = Vec::with_capacity(new_values.len());
+        Ok(())
+    }
 
-        for cell in new_values.iter() {
-            cells.push(InternalCell {
-                column_id: cell.column_id,
-                data: Self::encode_cell(&cell.data)?,
-            });
+    fn update_rows(&mut self, row_ids: Vec<RowId>, row: Row) -> Result<(), DataBaseErrors> {
+        info!("Update rows is called for {} rows", row_ids.len());
+        info!("Logging update operation for {} rows", row_ids.len());
+        self.log_operation(DataBaseOperation::UpdateRows {
+            table_id: self.table_id,
+            row_ids: row_ids.clone(),
+            row: row.clone(),
+        })?;
+
+        for row_id in row_ids {
+            self.apply_row_update(row_id, &row)?;
         }
 
-        for row_id in &row_ids {
-            self.log_operation(DataBaseOperation::UpdateRow {
-                table_id: self.table_id,
-                row_id: *row_id,
-                cells: cells.clone(),
-            })?;
-
-            let _ = match self.internal_update_row(*row_id, cells.clone()) {
-                Ok(_) => continue,
-                Err(e) => return Err(e),
-            };
-        }
         Ok(())
     }
 
@@ -668,43 +585,26 @@ impl TableManager for InternalTableSchema {
         search_criterias: Vec<SearchCriteria>,
         projection: Option<Projection>,
         sort_by: Option<SortBy>,
-    ) -> Result<Vec<Vec<CellStructure>>, DataBaseErrors> {
-        let mut matched_rows: Vec<Vec<InternalCell>> = Vec::new();
+    ) -> Result<Vec<Row>, DataBaseErrors> {
+        let mut matched_rows: Vec<Row> = Vec::new();
 
-        // Phase 1: Filter rows based on search criteria (work with InternalCell)
-        for (_row_id, row) in &self.rows {
-            let is_match = search_criterias.iter().all(|criteria| {
-                row.iter()
-                    .find(|cell| cell.column_id == criteria.column_id)
-                    .map(|cell| match criteria.operator {
-                        SearchOperator::Equal => {
-                            cell.data == Self::encode_cell(&criteria.value).unwrap()
-                        }
-                        SearchOperator::NotEqual => {
-                            cell.data != Self::encode_cell(&criteria.value).unwrap()
-                        }
-                        SearchOperator::GreaterThan => {
-                            cell.data > Self::encode_cell(&criteria.value).unwrap()
-                        }
-                        SearchOperator::LessThan => {
-                            cell.data < Self::encode_cell(&criteria.value).unwrap()
-                        }
-                        SearchOperator::GreaterThanOrEqual => {
-                            cell.data >= Self::encode_cell(&criteria.value).unwrap()
-                        }
-                        SearchOperator::LessThanOrEqual => {
-                            cell.data <= Self::encode_cell(&criteria.value).unwrap()
-                        }
-                    })
-                    .unwrap_or(false)
-            });
-
-            if is_match {
-                matched_rows.push(row.clone());
+        if let Some(candidate_row_ids) = self.indexed_row_candidates(&search_criterias) {
+            for row_id in candidate_row_ids {
+                if let Some(row) = self.rows.get(&row_id) {
+                    if Self::row_matches_criteria(row, &search_criterias) {
+                        matched_rows.push(row.clone());
+                    }
+                }
+            }
+        } else {
+            for row in self.rows.values() {
+                if Self::row_matches_criteria(row, &search_criterias) {
+                    matched_rows.push(row.clone());
+                }
             }
         }
 
-        // Phase 2: Apply sorting (on InternalCell/Vec<u8> before decoding)
+        // Phase 2: Apply sorting (on CellSchema/Vec<u8> before decoding)
         if let Some(sort) = sort_by {
             matched_rows.sort_by(|row_a, row_b| {
                 let cell_a = row_a.iter().find(|cell| cell.column_id == sort.column_id);
@@ -737,39 +637,19 @@ impl TableManager for InternalTableSchema {
                 .collect();
         }
 
-        // Phase 4: Decode to CellStructure (only for projected columns)
-        let mut decoded_rows: Vec<Vec<CellStructure>> = Vec::new();
-        for row in matched_rows {
-            let mut decoded_cells = Vec::new();
-            for cell in row {
-                decoded_cells.push(CellStructure {
-                    column_id: cell.column_id,
-                    data: Self::decode_cell(&cell.data)?,
-                });
-            }
-            decoded_rows.push(decoded_cells);
-        }
-
-        Ok(decoded_rows)
+        Ok(matched_rows)
     }
 
-    fn get_row(&self, row_id: u64) -> Result<Vec<CellStructure>, DataBaseErrors> {
-        let row = self
-            .rows
-            .iter()
-            .find(|r| *r.0 == row_id)
-            .ok_or(DataBaseErrors::RowNotFound(row_id))?;
-
-        let mut decoded_cells = Vec::with_capacity(row.1.len());
-
-        for cell in row.1.iter() {
-            decoded_cells.push(CellStructure {
-                column_id: cell.column_id,
-                data: Self::decode_cell(&cell.data)?,
-            });
+    fn get_rows(&self, row_ids: &Vec<RowId>) -> Result<Vec<Row>, DataBaseErrors> {
+        let mut filtered_rows = Vec::new();
+        for row_id in row_ids {
+            let value = match self.rows.get(&row_id) {
+                Some(value) => value.clone(),
+                None => return Err(DataBaseErrors::RowNotFound(*row_id)),
+            };
+            filtered_rows.push(value);
         }
-
-        Ok(decoded_cells)
+        Ok(filtered_rows)
     }
 
     fn get_size(&self) -> usize {
@@ -787,11 +667,11 @@ impl TableManager for InternalTableSchema {
 impl TableWriteAheadLog for InternalTableSchema {
     fn wal_create_column(
         &mut self,
-        column_id: u64,
+        column_id: ColumnId,
         column_name: String,
         data_type: DataType,
         constraints: Vec<Constraint>,
-        index: Option<BTreeMap<Vec<u8>, Vec<u64>>>,
+        index: Option<Index>,
     ) -> Result<(), DataBaseErrors> {
         if self.columns.iter().any(|c| c.1.name == column_name) {
             return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
@@ -811,7 +691,7 @@ impl TableWriteAheadLog for InternalTableSchema {
                     "WAL replay: Creating empty index for column {} with constraints",
                     column_id
                 );
-                Some(BTreeMap::new())
+                Some(Index::new())
             }
         } else {
             // If constraints don't require an index, discard any index from WAL
@@ -833,7 +713,8 @@ impl TableWriteAheadLog for InternalTableSchema {
         );
         Ok(())
     }
-    fn wal_drop_column(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+
+    fn wal_drop_column(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         if !self.columns.contains_key(&column_id) {
             return Err(DataBaseErrors::ColumnNotFound(column_id));
         }
@@ -842,10 +723,11 @@ impl TableWriteAheadLog for InternalTableSchema {
 
         Ok(())
     }
+
     fn wal_create_index(
         &mut self,
-        column_id: u64,
-        index: BTreeMap<Vec<u8>, Vec<u64>>,
+        column_id: ColumnId,
+        index: Index,
     ) -> Result<(), DataBaseErrors> {
         let column = self
             .columns
@@ -861,7 +743,8 @@ impl TableWriteAheadLog for InternalTableSchema {
         info!("WAL replay: Index restored for column {}", column_id);
         Ok(())
     }
-    fn wal_drop_index(&mut self, column_id: u64) -> Result<(), DataBaseErrors> {
+
+    fn wal_drop_index(&mut self, column_id: ColumnId) -> Result<(), DataBaseErrors> {
         let column = self
             .columns
             .get_mut(&column_id)
@@ -876,24 +759,25 @@ impl TableWriteAheadLog for InternalTableSchema {
         info!("WAL replay: Index dropped for column {}", column_id);
         Ok(())
     }
-    fn wal_insert_row(
-        &mut self,
-        row_id: u64,
-        row: Vec<InternalCell>,
-    ) -> Result<(), DataBaseErrors> {
-        if row_id >= self.next_row_id {
-            self.next_row_id = row_id + 1;
+
+    fn wal_insert_rows(&mut self, rows: Vec<(RowId, Row)>) -> Result<(), DataBaseErrors> {
+        for (row_id, _) in &rows {
+            if *row_id >= self.next_row_id {
+                self.next_row_id = *row_id + 1;
+            }
         }
-        self.internal_insert_row(row_id, row)
+        self.insert_rows(rows)
     }
-    fn wal_delete_row(&mut self, row_id: u64) -> Result<(), DataBaseErrors> {
-        self.internal_delete_row(row_id)
+
+    fn wal_delete_rows(&mut self, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
+        self.delete_rows(row_ids)
     }
-    fn wal_update_row(
-        &mut self,
-        row_id: u64,
-        cells: Vec<InternalCell>,
-    ) -> Result<(), DataBaseErrors> {
-        self.internal_update_row(row_id, cells)
+
+    fn wal_update_rows(&mut self, row_ids: Vec<RowId>, row: Row) -> Result<(), DataBaseErrors> {
+        for row_id in row_ids {
+            self.apply_row_update(row_id, &row)?;
+        }
+
+        Ok(())
     }
 }
