@@ -7,6 +7,7 @@ use crate::backend::errors::DataBaseErrors;
 use crate::backend::storage::wal::{DataBaseOperation, WriteAheadLogBase, WriteAheadLogManager};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::{debug, error, info};
 
@@ -46,7 +47,7 @@ where
         .collect())
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InternalDatabaseSchema {
     #[serde(
         serialize_with = "serialize_tables",
@@ -54,11 +55,23 @@ pub struct InternalDatabaseSchema {
     )]
     pub tables: BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>,
     pub tables_index: BTreeMap<String, TableId>,
-    next_table_id: TableId,
+    next_table_id: AtomicU64,
     #[serde(skip)]
     pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
     #[serde(skip)]
     pub wal_manager: Arc<Mutex<WriteAheadLogManager>>,
+}
+
+impl Clone for InternalDatabaseSchema {
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            tables_index: self.tables_index.clone(),
+            next_table_id: AtomicU64::new(self.next_table_id.load(Ordering::SeqCst)),
+            internal_state_manager: self.internal_state_manager.clone(),
+            wal_manager: self.wal_manager.clone(),
+        }
+    }
 }
 
 pub trait DataBaseManager {
@@ -177,7 +190,7 @@ impl InternalDatabaseSchema {
         InternalDatabaseSchema {
             tables: BTreeMap::new(),
             tables_index: BTreeMap::new(),
-            next_table_id: 0,
+            next_table_id: AtomicU64::new(0),
             internal_state_manager,
             wal_manager: wal_manager,
         }
@@ -345,8 +358,7 @@ impl DataBaseManager for InternalDatabaseSchema {
             return Err(DataBaseErrors::TableAlreadyExists(table_name));
         }
 
-        let table_id = self.next_table_id;
-        self.next_table_id += 1;
+        let table_id = self.next_table_id.fetch_add(1, Ordering::SeqCst);
         debug!("Assigned table ID {} to table '{}'", table_id, table_name);
 
         debug!("Logging table creation to WAL");
@@ -577,7 +589,7 @@ impl DataBaseManager for InternalDatabaseSchema {
                 );
                 match i.write() {
                     Ok(mut guard) => {
-                        let start_row_id = guard.next_row_id;
+                        let start_row_id = guard.next_row_id.fetch_add(row_count as u64, Ordering::SeqCst);
                         let processed_rows = guard.pre_insert_rows(&rows, start_row_id);
                         match &processed_rows {
                             Ok(_) => info!("Successfully computed rows"),
@@ -588,7 +600,6 @@ impl DataBaseManager for InternalDatabaseSchema {
                         let result = guard.insert_rows(processed_rows);
                         match &result {
                             Ok(_) => {
-                                guard.next_row_id += row_count as u64;
                                 info!(
                                     "Successfully inserted {} rows into table {}",
                                     row_count, table_id

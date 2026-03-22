@@ -1,5 +1,6 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::config::InternalStateManager;
 use crate::backend::core::search::{OrderBy, Projection, SearchCriteria, SearchOperator, SortBy};
@@ -78,8 +79,8 @@ impl InternalTableSchema {
             name,
             columns: BTreeMap::new(),
             rows: BTreeMap::new(),
-            next_row_id: 0,
-            next_column_id: 0,
+            next_row_id: AtomicU64::new(0),
+            next_column_id: AtomicU64::new(0),
             internal_state_manager,
             wal_manager,
         }
@@ -317,8 +318,7 @@ impl TableManager for InternalTableSchema {
             return Err(DataBaseErrors::ColumnAlreadyExists(column_name));
         }
 
-        let column_id = self.next_column_id;
-        self.next_column_id += 1;
+        let column_id = self.next_column_id.fetch_add(1, Ordering::SeqCst);
 
         // Only create index if column has Unique or PrimaryKey constraint
         let index = if Self::should_create_index(&constraints) {
@@ -762,8 +762,8 @@ impl TableWriteAheadLog for InternalTableSchema {
 
     fn wal_insert_rows(&mut self, rows: Vec<(RowId, Row)>) -> Result<(), DataBaseErrors> {
         for (row_id, _) in &rows {
-            if *row_id >= self.next_row_id {
-                self.next_row_id = *row_id + 1;
+            if *row_id >= self.next_row_id.load(Ordering::SeqCst) {
+                self.next_row_id.fetch_add(*row_id + 1, Ordering::SeqCst);
             }
         }
         self.insert_rows(rows)

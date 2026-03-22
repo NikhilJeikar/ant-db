@@ -4,6 +4,7 @@ use ordered_float::NotNan;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use twox_hash::XxHash64;
 
@@ -161,7 +162,7 @@ pub struct TableSchema {
     pub columns: Vec<ColumnSchema>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InternalTableSchema {
     pub table_id: TableId,
 
@@ -169,11 +170,26 @@ pub struct InternalTableSchema {
     pub columns: BTreeMap<ColumnId, ColumnSchema>,
     pub rows: BTreeMap<RowId, Row>,
 
-    pub next_row_id: RowId,
-    pub next_column_id: ColumnId,
+    pub next_row_id: AtomicU64,
+    pub next_column_id: AtomicU64,
 
     #[serde(skip)]
     pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
     #[serde(skip)]
     pub wal_manager: Arc<Mutex<WriteAheadLogManager>>,
+}
+
+impl Clone for InternalTableSchema {
+    fn clone(&self) -> Self {
+        Self {
+            table_id: self.table_id,
+            name: self.name.clone(),
+            columns: self.columns.clone(),
+            rows: self.rows.clone(),
+            next_row_id: AtomicU64::new(self.next_row_id.load(Ordering::SeqCst)),
+            next_column_id: AtomicU64::new(self.next_column_id.load(Ordering::SeqCst)),
+            internal_state_manager: self.internal_state_manager.clone(),
+            wal_manager: self.wal_manager.clone(),
+        }
+    }
 }
