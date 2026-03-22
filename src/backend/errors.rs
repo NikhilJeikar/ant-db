@@ -10,6 +10,9 @@ pub enum DataBaseErrors {
     ColumnNotFound(u64),
     #[error("Index not found for column {0}.")]
     IndexNotFound(u64),
+    #[error("Index already exist for column {0}.")]
+    IndexExist(&'static str),
+
 
     // Row-related errors
     #[error("Row with ID '{0}' not found in the table.")]

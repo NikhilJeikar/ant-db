@@ -1,11 +1,13 @@
-use crate::backend::core::types::{ColumnId, HashType};
-use crate::backend::errors::DataBaseErrors;
 use ordered_float::NotNan;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
+use std::slice::{Iter, IterMut};
+use std::vec::IntoIter;
 use twox_hash::XxHash64;
 
+use crate::backend::core::column::{ColumnID, HashType};
+
+pub type RowID = u64;
 pub type TransactionID = u64;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -29,7 +31,7 @@ pub enum DataBaseDataType {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cell {
-    pub column_id: ColumnId,
+    pub column_id: ColumnID,
     pub data: DataBaseDataType,
 }
 
@@ -53,7 +55,7 @@ pub struct Row {
 }
 
 impl Row {
-    fn new(&mut self, transaction_id: TransactionID, data: Vec<Cell>) -> Self {
+    pub fn new(transaction_id: TransactionID, data: Vec<Cell>) -> Self {
         let mut row = Row { data: Vec::new() };
         row.data.push(InternalRow {
             created_by: transaction_id,
@@ -62,7 +64,8 @@ impl Row {
         });
         row
     }
-    fn remove(&mut self, refered_transaction_id: TransactionID, transaction_id: TransactionID) {
+
+    pub fn remove(&mut self, refered_transaction_id: TransactionID, transaction_id: TransactionID) {
         // NOTE: This could turn bad when Multiple people try to delete the entry, We only take who did it first
         for row in &mut self.data {
             if row.created_by <= refered_transaction_id && row.deleted_by.is_none() {
@@ -70,7 +73,8 @@ impl Row {
             }
         }
     }
-    fn update(&mut self, refered_transaction_id: TransactionID, transaction_id: TransactionID, data: Vec<Cell>) {
+
+    pub fn update(&mut self, refered_transaction_id: TransactionID, transaction_id: TransactionID, data: Vec<Cell>) {
         for row in &mut self.data {
             // NOTE: This could turn bad when Multiple people try to update the entry, We only take who did it first
             if row.created_by == refered_transaction_id && row.deleted_by.is_none() {
@@ -86,9 +90,26 @@ impl Row {
         );
     }
 
-    fn prune(&mut self, transaction_id: TransactionID) {
+    pub fn prune(&mut self, transaction_id: TransactionID) {
         self.data.retain(|row| {
             row.deleted_by.map_or(true, |del| del > transaction_id)
         });
+    }
+
+    pub fn get_raw_rows(&self) -> &Vec<InternalRow> {
+        &self.data
+    }
+
+    pub fn get_versioned_row(&self,refered_transaction_id: TransactionID, transaction_id: TransactionID) -> Option<&InternalRow> {
+        for row in &self.data {
+            if row.created_by == refered_transaction_id && row.deleted_by != Some(transaction_id) {
+                return Some(row);
+            }
+        }
+        return None;
+    }
+
+    pub fn is_visible(&self, transaction_id: TransactionID) {
+        
     }
 }
