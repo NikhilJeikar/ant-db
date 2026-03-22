@@ -1,14 +1,12 @@
 use ordered_float::NotNan;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
-use std::slice::{Iter, IterMut};
-use std::vec::IntoIter;
 use twox_hash::XxHash64;
 
 use crate::backend::core::column::{ColumnID, HashType};
+use crate::backend::core::transaction::{Transaction,TransactionID};
 
 pub type RowID = u64;
-pub type TransactionID = u64;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub enum DataBaseDataType {
@@ -45,10 +43,19 @@ impl Cell {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct InternalRow {
-    created_by: TransactionID,
-    deleted_by: Option<TransactionID>,
-    data: Vec<Cell>,
+    pub created_by: TransactionID,
+    pub deleted_by: Option<TransactionID>,
+    pub data: Vec<Cell>,
 }
+
+impl InternalRow {
+    fn is_visible(&self, transaction: &Transaction) -> bool {
+        transaction
+            .snapshot
+            .is_visible(self.created_by, self.deleted_by)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row {
     data: Vec<InternalRow>,
@@ -65,34 +72,36 @@ impl Row {
         row
     }
 
-    pub fn remove(&mut self, refered_transaction_id: TransactionID, transaction_id: TransactionID) {
-        // NOTE: This could turn bad when Multiple people try to delete the entry, We only take who did it first
-        for row in &mut self.data {
-            if row.created_by <= refered_transaction_id && row.deleted_by.is_none() {
-                row.deleted_by = Some(transaction_id);
+    pub fn remove(&mut self, transaction: &Transaction) {
+        for row in self.data.iter_mut().rev() {
+            if row.is_visible(transaction) {
+                row.deleted_by = Some(transaction.transaction_id);
+                break;
             }
         }
     }
 
-    pub fn update(&mut self, refered_transaction_id: TransactionID, transaction_id: TransactionID, data: Vec<Cell>) {
-        for row in &mut self.data {
-            // NOTE: This could turn bad when Multiple people try to update the entry, We only take who did it first
-            if row.created_by == refered_transaction_id && row.deleted_by.is_none() {
-                row.deleted_by = Some(transaction_id);
+    pub fn update(&mut self, transaction: &Transaction, data: Vec<Cell>) {
+        for row in self.data.iter_mut().rev() {
+            if row.is_visible(transaction) {
+                row.deleted_by = Some(transaction.transaction_id);
+                break;
             }
         }
-        self.data.push(
-            InternalRow {
-            created_by: transaction_id,
+
+        self.data.push(InternalRow {
+            created_by: transaction.transaction_id,
             deleted_by: None,
             data,
-        }
-        );
+        });
     }
 
-    pub fn prune(&mut self, transaction_id: TransactionID) {
+    pub fn prune(&mut self, oldest_active_txn: TransactionID) {
         self.data.retain(|row| {
-            row.deleted_by.map_or(true, |del| del > transaction_id)
+            match row.deleted_by {
+                None => true,
+                Some(del) => del >= oldest_active_txn,
+            }
         });
     }
 
@@ -100,16 +109,10 @@ impl Row {
         &self.data
     }
 
-    pub fn get_versioned_row(&self,refered_transaction_id: TransactionID, transaction_id: TransactionID) -> Option<&InternalRow> {
-        for row in &self.data {
-            if row.created_by == refered_transaction_id && row.deleted_by != Some(transaction_id) {
-                return Some(row);
-            }
-        }
-        return None;
-    }
-
-    pub fn is_visible(&self, transaction_id: TransactionID) {
-        
+    pub fn get_versioned_row(&self, transaction: &Transaction) -> Option<&InternalRow> {
+        self.data
+            .iter()
+            .rev()
+            .find(|row| row.is_visible(transaction))
     }
 }

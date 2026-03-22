@@ -11,7 +11,7 @@ pub enum DataBaseErrors {
     #[error("Index not found for column {0}.")]
     IndexNotFound(u64),
     #[error("Index already exist for column {0}.")]
-    IndexExist(&'static str),
+    IndexExist(String),
 
 
     // Row-related errors
