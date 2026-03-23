@@ -9,9 +9,16 @@ pub enum DataBaseErrors {
     #[error("Column '{0}' not found in the table.")]
     ColumnNotFound(u64),
     #[error("Index not found for column {0}.")]
-    IndexNotFound(u64),
+    IndexNotFound(String),
     #[error("Index already exist for column {0}.")]
     IndexExist(String),
+    
+    //Constraint errors
+    #[error("Value cannot be nullable.")]
+    NullValue(),
+    #[error("Unique Constraint failed for {0}")]
+    UniqueConstraint(String),
+    
 
 
     // Row-related errors

@@ -8,21 +8,17 @@ pub type TransactionID = u64;
 pub struct TransactionSnapshot {
     smallest_active_transaction_id: TransactionID,
     last_possible_transaction_id: TransactionID,
-    active_transaction: HashSet<TransactionID>
+    active_transaction: HashSet<TransactionID>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Transaction {
     pub transaction_id: TransactionID,
-    pub snapshot: TransactionSnapshot
+    pub snapshot: TransactionSnapshot,
 }
 
 impl TransactionSnapshot {
-    pub fn is_visible(
-        &self,
-        created_by: TransactionID,
-        deleted_by: Option<TransactionID>,
-    ) -> bool {
+    pub fn is_visible(&self, created_by: TransactionID, deleted_by: Option<TransactionID>) -> bool {
         if created_by > self.last_possible_transaction_id {
             return false; // created after snapshot
         }

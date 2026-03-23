@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use twox_hash::XxHash64;
 
-use crate::backend::core::column::{ColumnID, HashType};
-use crate::backend::core::transaction::{Transaction,TransactionID};
+use crate::backend::core::column::{ColumnID, DataBaseDataType, HashType};
+use crate::backend::core::transaction::{Transaction, TransactionID};
 
 pub type RowID = u64;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub enum DataBaseDataType {
+pub enum DataBaseDataEntry {
+    Null,
     IntegerU8(u8),
     IntegerU16(u16),
     IntegerU32(u32),
@@ -27,10 +28,37 @@ pub enum DataBaseDataType {
     Bytes(Vec<u8>),
 }
 
+impl DataBaseDataEntry {
+    pub fn data_type(&self) -> DataBaseDataType {
+        match self {
+            DataBaseDataEntry::Null => DataBaseDataType::Null,
+
+            DataBaseDataEntry::IntegerU8(_) => DataBaseDataType::IntegerU8,
+            DataBaseDataEntry::IntegerU16(_) => DataBaseDataType::IntegerU16,
+            DataBaseDataEntry::IntegerU32(_) => DataBaseDataType::IntegerU32,
+            DataBaseDataEntry::IntegerU64(_) => DataBaseDataType::IntegerU64,
+            DataBaseDataEntry::IntegerU128(_) => DataBaseDataType::IntegerU128,
+
+            DataBaseDataEntry::IntegerI8(_) => DataBaseDataType::IntegerI8,
+            DataBaseDataEntry::IntegerI16(_) => DataBaseDataType::IntegerI16,
+            DataBaseDataEntry::IntegerI32(_) => DataBaseDataType::IntegerI32,
+            DataBaseDataEntry::IntegerI64(_) => DataBaseDataType::IntegerI64,
+            DataBaseDataEntry::IntegerI128(_) => DataBaseDataType::IntegerI128,
+
+            DataBaseDataEntry::FloatF32(_) => DataBaseDataType::FloatF32,
+            DataBaseDataEntry::FloatF64(_) => DataBaseDataType::FloatF64,
+
+            DataBaseDataEntry::String(_) => DataBaseDataType::String,
+            DataBaseDataEntry::Boolean(_) => DataBaseDataType::Boolean,
+            DataBaseDataEntry::Bytes(_) => DataBaseDataType::Bytes,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cell {
     pub column_id: ColumnID,
-    pub data: DataBaseDataType,
+    pub data: DataBaseDataEntry,
 }
 
 impl Cell {
@@ -38,6 +66,10 @@ impl Cell {
         let mut hasher = XxHash64::with_seed(0);
         self.hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self.data, DataBaseDataEntry::Null)
     }
 }
 
@@ -97,11 +129,9 @@ impl Row {
     }
 
     pub fn prune(&mut self, oldest_active_txn: TransactionID) {
-        self.data.retain(|row| {
-            match row.deleted_by {
-                None => true,
-                Some(del) => del >= oldest_active_txn,
-            }
+        self.data.retain(|row| match row.deleted_by {
+            None => true,
+            Some(del) => del >= oldest_active_txn,
         });
     }
 
