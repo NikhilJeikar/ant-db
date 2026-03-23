@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::core::row::{Cell, Row, RowID};
 use crate::backend::core::table::TableID;
-use crate::backend::core::transaction::{Transaction, TransactionID};
+use crate::backend::core::transaction::{Transaction, TransactionHeader, TransactionID};
 use crate::backend::errors::DataBaseErrors;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -43,8 +43,9 @@ pub enum DataBaseDataType {
 pub type ColumnID = u16;
 pub type HashType = u64;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Column {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InternalColumn {
+    pub transaction_header: TransactionHeader,
     pub column_id: ColumnID,
     pub name: String,
     pub data_type: DataBaseDataType,
@@ -53,12 +54,13 @@ pub struct Column {
     is_nullable: bool,
 }
 
-impl Column {
+impl InternalColumn {
     pub fn new(
         column_id: ColumnID,
         name: String,
         data_type: DataBaseDataType,
         constraint: BTreeSet<Constraint>,
+        transaction: &Transaction,
     ) -> Self {
         let mut is_nullable = true;
         let mut index = None;
@@ -70,6 +72,10 @@ impl Column {
             index = Some(BTreeMap::new());
         }
         Self {
+            transaction_header: TransactionHeader {
+                created_by: transaction.transaction_id,
+                deleted_by: None,
+            },
             column_id,
             name,
             data_type,
@@ -126,7 +132,7 @@ impl Column {
             row_ids.retain(|row_id| {
                 if let Some(row) = rows.get(row_id) {
                     row.get_raw_rows().iter().any(|version| {
-                        match version.deleted_by {
+                        match version.transaction_header.deleted_by {
                             None => true, // still alive
                             Some(del) => del >= oldest_active_txn,
                         }
@@ -211,5 +217,120 @@ impl Column {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Column {
+    versions: Vec<InternalColumn>,
+}
+
+impl Column {
+    fn new(
+        column_id: ColumnID,
+        name: String,
+        data_type: DataBaseDataType,
+        constraint: BTreeSet<Constraint>,
+        transaction: &Transaction,
+    ) -> Self {
+        let mut column = Column {
+            versions: Vec::new(),
+        };
+        column.versions.push(InternalColumn::new(
+            column_id,
+            name,
+            data_type,
+            constraint,
+            transaction,
+        ));
+        column
+    }
+
+    pub fn remove(&mut self, transaction: &Transaction) {
+        for column in self.versions.iter_mut().rev() {
+            if column.transaction_header.is_visible(transaction) {
+                column.transaction_header.deleted_by = Some(transaction.transaction_id);
+                break;
+            }
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        name: Option<String>,
+        data_type: Option<DataBaseDataType>,
+        constraint: Option<BTreeSet<Constraint>>,
+        transaction: &Transaction,
+    ) {
+        let current = match self
+            .versions
+            .iter()
+            .rev()
+            .find(|col| col.transaction_header.is_visible(transaction))
+            .cloned()
+        {
+            Some(col) => col,
+            None => return,
+        };
+
+        let new_constraint = constraint.unwrap_or_else(|| current.constraint.clone());
+
+        let mut is_nullable = true;
+        let mut index = current.index.clone();
+
+        if new_constraint.contains(&Constraint::NotNull) {
+            is_nullable = false;
+        }
+
+        if new_constraint.contains(&Constraint::PrimaryKey)
+            || new_constraint.contains(&Constraint::Unique)
+        {
+            if index.is_none() {
+                index = Some(BTreeMap::new());
+            }
+        } else {
+            index = None;
+        }
+
+        for col in self.versions.iter_mut().rev() {
+            if col.transaction_header.is_visible(transaction) {
+                col.transaction_header.deleted_by = Some(transaction.transaction_id);
+                break;
+            }
+        }
+
+        let new_column = InternalColumn {
+            transaction_header: TransactionHeader {
+                created_by: transaction.transaction_id,
+                deleted_by: None,
+            },
+            column_id: current.column_id,
+            name: name.unwrap_or(current.name.clone()),
+            data_type: data_type.unwrap_or(current.data_type.clone()),
+            constraint: new_constraint,
+            index,
+            is_nullable,
+        };
+
+        self.versions.push(new_column);
+    }
+
+    pub fn prune(&mut self, oldest_active_txn: TransactionID) {
+        self.versions
+            .retain(|row| match row.transaction_header.deleted_by {
+                None => true,
+                Some(del) => del >= oldest_active_txn,
+            });
+    }
+
+    pub fn get_raw_columns(&self) -> &Vec<InternalColumn> {
+        &self.versions
+    }
+
+    pub fn get_versioned_column(&self, transaction: &Transaction) -> Option<&InternalColumn> {
+        self.versions
+            .iter()
+            .rev()
+            .find(|column| column.transaction_header.is_visible(transaction))
     }
 }

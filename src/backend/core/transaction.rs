@@ -17,28 +17,36 @@ pub struct Transaction {
     pub snapshot: TransactionSnapshot,
 }
 
-impl TransactionSnapshot {
-    pub fn is_visible(&self, created_by: TransactionID, deleted_by: Option<TransactionID>) -> bool {
-        if created_by > self.last_possible_transaction_id {
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransactionHeader {
+    pub created_by: TransactionID,
+    pub deleted_by: Option<TransactionID>,
+}
+
+
+impl TransactionHeader {
+    pub fn is_visible(&self, txn: &Transaction) -> bool {
+        if self.created_by > txn.snapshot.last_possible_transaction_id {
             return false; // created after snapshot
         }
 
-        if self.active_transaction.contains(&created_by) {
+        if txn.snapshot.active_transaction.contains(&self.created_by) {
             return false; // still in progress
         }
 
-        match deleted_by {
+        match self.deleted_by {
             None => return true, // not deleted
 
             Some(deleted_by) => {
                 // deleted by a transaction definitely committed before snapshot
-                if deleted_by < self.smallest_active_transaction_id {
+                if deleted_by < txn.snapshot.smallest_active_transaction_id {
                     return false;
                 }
 
                 // deleted by a transaction that committed before snapshot
-                if deleted_by <= self.last_possible_transaction_id
-                    && !self.active_transaction.contains(&deleted_by)
+                if deleted_by <= txn.snapshot.last_possible_transaction_id
+                    && !txn.snapshot.active_transaction.contains(&deleted_by)
                 {
                     return false;
                 }

@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use twox_hash::XxHash64;
 
 use crate::backend::core::column::{ColumnID, DataBaseDataType, HashType};
-use crate::backend::core::transaction::{Transaction, TransactionID};
+use crate::backend::core::transaction::{Transaction, TransactionHeader, TransactionID};
 
 pub type RowID = u64;
 
@@ -75,74 +75,69 @@ impl Cell {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct InternalRow {
-    pub created_by: TransactionID,
-    pub deleted_by: Option<TransactionID>,
+    pub transaction_header: TransactionHeader,
     pub data: Vec<Cell>,
-}
-
-impl InternalRow {
-    fn is_visible(&self, transaction: &Transaction) -> bool {
-        transaction
-            .snapshot
-            .is_visible(self.created_by, self.deleted_by)
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row {
-    data: Vec<InternalRow>,
+    versions: Vec<InternalRow>,
 }
 
 impl Row {
     pub fn new(transaction_id: TransactionID, data: Vec<Cell>) -> Self {
-        let mut row = Row { data: Vec::new() };
-        row.data.push(InternalRow {
-            created_by: transaction_id,
-            deleted_by: None,
+        let mut row = Row { versions: Vec::new() };
+        row.versions.push(InternalRow {
+            transaction_header: TransactionHeader {
+                created_by: transaction_id,
+                deleted_by: None,
+            },
             data,
         });
         row
     }
 
     pub fn remove(&mut self, transaction: &Transaction) {
-        for row in self.data.iter_mut().rev() {
-            if row.is_visible(transaction) {
-                row.deleted_by = Some(transaction.transaction_id);
+        for row in self.versions.iter_mut().rev() {
+            if row.transaction_header.is_visible(transaction) {
+                row.transaction_header.deleted_by = Some(transaction.transaction_id);
                 break;
             }
         }
     }
 
     pub fn update(&mut self, transaction: &Transaction, data: Vec<Cell>) {
-        for row in self.data.iter_mut().rev() {
-            if row.is_visible(transaction) {
-                row.deleted_by = Some(transaction.transaction_id);
+        for row in self.versions.iter_mut().rev() {
+            if row.transaction_header.is_visible(transaction) {
+                row.transaction_header.deleted_by = Some(transaction.transaction_id);
                 break;
             }
         }
 
-        self.data.push(InternalRow {
-            created_by: transaction.transaction_id,
-            deleted_by: None,
+        self.versions.push(InternalRow {
+            transaction_header: TransactionHeader {
+                created_by: transaction.transaction_id,
+                deleted_by: None,
+            },
             data,
         });
     }
 
     pub fn prune(&mut self, oldest_active_txn: TransactionID) {
-        self.data.retain(|row| match row.deleted_by {
+        self.versions.retain(|row| match row.transaction_header.deleted_by {
             None => true,
             Some(del) => del >= oldest_active_txn,
         });
     }
 
     pub fn get_raw_rows(&self) -> &Vec<InternalRow> {
-        &self.data
+        &self.versions
     }
 
     pub fn get_versioned_row(&self, transaction: &Transaction) -> Option<&InternalRow> {
-        self.data
+        self.versions
             .iter()
             .rev()
-            .find(|row| row.is_visible(transaction))
+            .find(|row| row.transaction_header.is_visible(transaction))
     }
 }
