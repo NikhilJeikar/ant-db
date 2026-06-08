@@ -166,6 +166,27 @@ impl SearchExpression {
             SearchExpression::Not(inner) => Ok(!inner.evaluate(row, column_map)?),
         }
     }
+
+    /// If this filter is a single `column = literal` (or `literal = column`), return the
+    /// column name and literal value for index lookup.
+    pub fn equality_lookup(&self) -> Option<(&str, &DataBaseDataEntry)> {
+        match self {
+            SearchExpression::Comparison {
+                left,
+                operator: SearchOperator::Equal,
+                right,
+            } => match (left.as_ref(), right.as_ref()) {
+                (SearchExpression::Column(name), SearchExpression::Literal(value)) => {
+                    Some((name, value))
+                }
+                (SearchExpression::Literal(value), SearchExpression::Column(name)) => {
+                    Some((name, value))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 impl SearchRequest {

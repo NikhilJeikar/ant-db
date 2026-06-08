@@ -661,6 +661,7 @@ impl Table {
                 transaction,
             ))),
         );
+        self.build_column_index_if_needed(column_id, transaction)?;
         Ok(column_id)
     }
 
@@ -683,6 +684,100 @@ impl Table {
         merged_constraints.extend(extra_constraints);
 
         column.update(None, None, Some(merged_constraints), transaction);
+        drop(column);
+        self.build_column_index_if_needed(column_id, transaction)?;
+        Ok(())
+    }
+
+    fn collect_all_rows(&self) -> HashMap<RowID, Row> {
+        let mut rows = HashMap::new();
+        if let Ok(row_space) = self.row_space.read() {
+            for page in row_space.values() {
+                if let Ok(page) = page.read() {
+                    for (row_id, row) in &page.rows {
+                        rows.insert(*row_id, row.clone());
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    fn build_column_index_if_needed(
+        &self,
+        column_id: ColumnID,
+        transaction: &Transaction,
+    ) -> Result<(), DataBaseErrors> {
+        let column = self.columns.get(&column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError("Column not found while building index".into())
+        })?;
+        let mut column = column
+            .write()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column write lock".into()))?;
+        if !column.is_indexed(transaction) {
+            return Ok(());
+        }
+        let rows = self.collect_all_rows();
+        column.create_index(&rows, transaction)?;
+        Ok(())
+    }
+
+    fn validate_row_data(
+        &self,
+        data: &AHashMap<ColumnID, DataBaseDataEntry>,
+        transaction: &Transaction,
+        exclude_row_id: Option<RowID>,
+    ) -> Result<(), DataBaseErrors> {
+        let all_rows = self.collect_all_rows();
+        for (&column_id, column) in self.columns.iter() {
+            let guard = column
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column read lock".into()))?;
+            let value = data
+                .get(&column_id)
+                .unwrap_or(&DataBaseDataEntry::Null);
+            guard.schema_validation(value, &all_rows, transaction, exclude_row_id)?;
+        }
+        Ok(())
+    }
+
+    fn update_indexes_for_row(
+        &self,
+        row_id: RowID,
+        data: &AHashMap<ColumnID, DataBaseDataEntry>,
+        transaction: &Transaction,
+    ) -> Result<(), DataBaseErrors> {
+        for (&column_id, column) in self.columns.iter() {
+            let mut guard = column.write().map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire column write lock".into())
+            })?;
+            if !guard.is_indexed(transaction) {
+                continue;
+            }
+            if let Some(value) = data.get(&column_id) {
+                guard.update_index(column_id, value.clone(), row_id, transaction);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_indexes_for_row(
+        &self,
+        row_id: RowID,
+        data: &AHashMap<ColumnID, DataBaseDataEntry>,
+        transaction: &Transaction,
+    ) -> Result<(), DataBaseErrors> {
+        for (&column_id, column) in self.columns.iter() {
+            let mut guard = column.write().map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire column write lock".into())
+            })?;
+            if !guard.is_indexed(transaction) {
+                continue;
+            }
+            if let Some(value) = data.get(&column_id) {
+                guard.remove_from_index(column_id, value, row_id, transaction);
+            }
+        }
         Ok(())
     }
 
@@ -854,8 +949,10 @@ impl Table {
         data: AHashMap<ColumnID, DataBaseDataEntry>,
         transaction: &Transaction,
     ) -> Result<RowID, DataBaseErrors> {
+        self.validate_row_data(&data, transaction, None)?;
+
         let row_id = self.next_row_id.fetch_add(1, Ordering::SeqCst) + 1;
-        let row = Row::new(transaction, data);
+        let row = Row::new(transaction, data.clone());
         let size = row_size_bytes(&row);
 
         let page_id = if size > self.page_size {
@@ -868,6 +965,8 @@ impl Table {
             .write()
             .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_locations write lock".into()))?
             .insert(row_id, page_id);
+
+        self.update_indexes_for_row(row_id, &data, transaction)?;
 
         Ok(row_id)
     }
@@ -906,11 +1005,43 @@ impl Table {
     ) -> Result<(), DataBaseErrors> {
         let page = self.page_for_row(row_id)?;
         let mut page = page.write().unwrap();
+        let row = page
+            .rows
+            .get(&row_id)
+            .ok_or(DataBaseErrors::RowNotFound(row_id))?;
+
+        let mut effective_data: AHashMap<ColumnID, DataBaseDataEntry> = row
+            .get_versioned_row(transaction)
+            .map(|version| version.data.iter().map(|(&k, v)| (k, v.clone())).collect())
+            .unwrap_or_default();
+        effective_data.extend(data.iter().map(|(&k, v)| (k, v.clone())));
+
+        self.validate_row_data(&effective_data, transaction, Some(row_id))?;
+
+        let old_values: AHashMap<ColumnID, DataBaseDataEntry> = row
+            .get_versioned_row(transaction)
+            .map(|version| {
+                data.keys()
+                    .filter_map(|column_id| {
+                        version
+                            .data
+                            .get(column_id)
+                            .map(|value| (*column_id, value.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.remove_indexes_for_row(row_id, &old_values, transaction)?;
+
         page.rows
             .get_mut(&row_id)
             .ok_or(DataBaseErrors::RowNotFound(row_id))?
-            .update(transaction, data);
+            .update(transaction, data.clone());
         page.is_dirty = true;
+        drop(page);
+
+        self.update_indexes_for_row(row_id, &effective_data, transaction)?;
+
         Ok(())
     }
 
@@ -1017,27 +1148,72 @@ impl Table {
 
         let mut rows: Vec<(RowID, AHashMap<ColumnID, DataBaseDataEntry>)> = Vec::new();
 
-        let page_ids: BTreeSet<PageID> = self
-            .row_locations
-            .read()
-            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into()))?
-            .values()
-            .copied()
-            .collect();
+        let candidate_row_ids: Option<BTreeSet<RowID>> =
+            if let Some(filter) = &request.filter {
+                if let Some((column_name, value)) = filter.equality_lookup() {
+                    if let Some(column_id) = visible_columns.get(column_name) {
+                        let column = self.columns.get(column_id).ok_or_else(|| {
+                            DataBaseErrors::QueryError(format!(
+                                "Column '{column_name}' not found while resolving index lookup",
+                            ))
+                        })?;
+                        let guard = column.read().map_err(|_| {
+                            DataBaseErrors::QueryError("Failed to acquire column read lock".into())
+                        })?;
+                        guard
+                            .index_lookup(value, transaction)
+                            .map(|ids| ids.into_iter().collect())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-        for page_id in page_ids {
-            let page = self.ensure_page_resident(page_id)?;
-            let page_guard = page.read().unwrap();
-            for (row_id, row) in page_guard.rows.iter() {
-                if let Some(version) = row.get_versioned_row(transaction) {
-                    let matches = match &request.filter {
-                        Some(filter) => filter.evaluate(&version.data, &visible_columns)?,
-                        None => true,
-                    };
-                    if matches {
-                        let row_clone: AHashMap<ColumnID, DataBaseDataEntry> =
-                            version.data.iter().map(|(&k, v)| (k, v.clone())).collect();
-                        rows.push((*row_id, row_clone));
+        let mut push_matching_row =
+            |row_id: RowID, version: &crate::backend::core::row::InternalRow| -> Result<(), DataBaseErrors> {
+                let matches = match &request.filter {
+                    Some(filter) => filter.evaluate(&version.data, &visible_columns)?,
+                    None => true,
+                };
+                if matches {
+                    let row_clone: AHashMap<ColumnID, DataBaseDataEntry> =
+                        version.data.iter().map(|(&k, v)| (k, v.clone())).collect();
+                    rows.push((row_id, row_clone));
+                }
+                Ok(())
+            };
+
+        if let Some(candidate_row_ids) = candidate_row_ids {
+            for row_id in candidate_row_ids {
+                let page = self.page_for_row(row_id)?;
+                let page_guard = page.read().unwrap();
+                if let Some(row) = page_guard.rows.get(&row_id) {
+                    if let Some(version) = row.get_versioned_row(transaction) {
+                        push_matching_row(row_id, version)?;
+                    }
+                }
+            }
+        } else {
+            let page_ids: BTreeSet<PageID> = self
+                .row_locations
+                .read()
+                .map_err(|_| {
+                    DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into())
+                })?
+                .values()
+                .copied()
+                .collect();
+
+            for page_id in page_ids {
+                let page = self.ensure_page_resident(page_id)?;
+                let page_guard = page.read().unwrap();
+                for (row_id, row) in page_guard.rows.iter() {
+                    if let Some(version) = row.get_versioned_row(transaction) {
+                        push_matching_row(*row_id, version)?;
                     }
                 }
             }

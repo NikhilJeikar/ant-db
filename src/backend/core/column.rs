@@ -85,27 +85,45 @@ impl InternalColumn {
         }
     }
 
-    pub fn create_index(&mut self, rows: &HashMap<RowID, Row>) -> Result<usize, DataBaseErrors> {
-        if self.index.is_some() {
-            return Err(DataBaseErrors::IndexExist(self.name.clone()));
+    pub fn is_indexed(&self) -> bool {
+        self.index.is_some()
+    }
+
+    pub fn index_lookup(&self, value: &DataBaseDataEntry) -> Option<&BTreeSet<RowID>> {
+        self.index
+            .as_ref()
+            .and_then(|index| index.get(&value.key(self.column_id)))
+    }
+
+    pub fn create_index(
+        &mut self,
+        rows: &HashMap<RowID, Row>,
+        transaction: &Transaction,
+    ) -> Result<usize, DataBaseErrors> {
+        if let Some(index) = &self.index {
+            if !index.is_empty() {
+                return Err(DataBaseErrors::IndexExist(self.name.clone()));
+            }
         }
 
         let mut index: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+        let mut indexed = 0usize;
 
         for (row_id, row) in rows {
-            for version in row.get_raw_rows() {
-                for (column_id, value) in &version.data {
-                    if *column_id == self.column_id {
-                        index.entry(value.key(*column_id)).or_default().insert(*row_id);
-                        break;
-                    }
+            if let Some(version) = row.get_versioned_row(transaction) {
+                if let Some(value) = version.data.get(&self.column_id) {
+                    index
+                        .entry(value.key(self.column_id))
+                        .or_default()
+                        .insert(*row_id);
+                    indexed += 1;
                 }
             }
         }
 
         self.index = Some(index);
 
-        Ok(rows.len())
+        Ok(indexed)
     }
 
     pub fn drop_index(&mut self) {
@@ -123,6 +141,24 @@ impl InternalColumn {
                 index.entry(value.key(column_id)).or_default().insert(row_id);
             }
             None => {}
+        }
+    }
+
+    pub fn remove_from_index(
+        &mut self,
+        column_id: ColumnID,
+        value: &DataBaseDataEntry,
+        row_id: RowID,
+    ) {
+        let Some(index) = self.index.as_mut() else {
+            return;
+        };
+        let key = value.key(column_id);
+        if let Some(row_ids) = index.get_mut(&key) {
+            row_ids.remove(&row_id);
+            if row_ids.is_empty() {
+                index.remove(&key);
+            }
         }
     }
 
@@ -162,6 +198,7 @@ impl InternalColumn {
         value: &DataBaseDataEntry,
         rows: &HashMap<RowID, Row>,
         transaction: &Transaction,
+        exclude_row_id: Option<RowID>,
     ) -> Result<(), DataBaseErrors> {
         for constraints in &self.constraints {
             match constraints {
@@ -173,18 +210,25 @@ impl InternalColumn {
                 Constraint::Unique | Constraint::PrimaryKey => {
                     match &self.index {
                         Some(index) => {
-                            for (_, row_ids) in index {
+                            let key = value.key(self.column_id);
+                            if let Some(row_ids) = index.get(&key) {
                                 for row_id in row_ids {
+                                    if Some(*row_id) == exclude_row_id {
+                                        continue;
+                                    }
                                     match rows.get(row_id) {
                                         Some(versioned_row) => {
                                             match versioned_row.get_versioned_row(transaction) {
                                                 Some(row) => {
-                                                    for (lookup_column_id, lookup_value) in &row.data {
-                                                        if *lookup_column_id == self.column_id {
-                                                            if lookup_value == value {
-                                                                return Err(DataBaseErrors::UniqueConstraint(self.name.clone()));
-                                                            }
-                                                            break;
+                                                    if let Some(lookup_value) =
+                                                        row.data.get(&self.column_id)
+                                                    {
+                                                        if lookup_value == value {
+                                                            return Err(
+                                                                DataBaseErrors::UniqueConstraint(
+                                                                    self.name.clone(),
+                                                                ),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -361,5 +405,83 @@ impl Column {
     ) -> Option<BTreeSet<Constraint>> {
         self.get_versioned_column(transaction)
             .map(|version| version.constraints.clone())
+    }
+
+    fn get_versioned_column_mut(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Option<&mut InternalColumn> {
+        self.versions
+            .iter_mut()
+            .rev()
+            .find(|column| column.transaction_header.is_visible(transaction))
+    }
+
+    pub fn create_index(
+        &mut self,
+        rows: &HashMap<RowID, Row>,
+        transaction: &Transaction,
+    ) -> Result<usize, DataBaseErrors> {
+        let Some(version) = self.get_versioned_column_mut(transaction) else {
+            return Err(DataBaseErrors::QueryError(
+                "No visible column version found while building index".into(),
+            ));
+        };
+        version.create_index(rows, transaction)
+    }
+
+    pub fn update_index(
+        &mut self,
+        column_id: ColumnID,
+        value: DataBaseDataEntry,
+        row_id: RowID,
+        transaction: &Transaction,
+    ) {
+        if let Some(version) = self.get_versioned_column_mut(transaction) {
+            version.update_index(column_id, value, row_id);
+        }
+    }
+
+    pub fn remove_from_index(
+        &mut self,
+        column_id: ColumnID,
+        value: &DataBaseDataEntry,
+        row_id: RowID,
+        transaction: &Transaction,
+    ) {
+        if let Some(version) = self.get_versioned_column_mut(transaction) {
+            version.remove_from_index(column_id, value, row_id);
+        }
+    }
+
+    pub fn schema_validation(
+        &self,
+        value: &DataBaseDataEntry,
+        rows: &HashMap<RowID, Row>,
+        transaction: &Transaction,
+        exclude_row_id: Option<RowID>,
+    ) -> Result<(), DataBaseErrors> {
+        let Some(version) = self.get_versioned_column(transaction) else {
+            return Ok(());
+        };
+        version.schema_validation(value, rows, transaction, exclude_row_id)
+    }
+
+    pub fn is_indexed(&self, transaction: &Transaction) -> bool {
+        self.get_versioned_column(transaction)
+            .map(|version| version.is_indexed())
+            .unwrap_or(false)
+    }
+
+    pub fn index_lookup(
+        &self,
+        value: &DataBaseDataEntry,
+        transaction: &Transaction,
+    ) -> Option<Vec<RowID>> {
+        self.get_versioned_column(transaction).and_then(|version| {
+            version
+                .index_lookup(value)
+                .map(|row_ids| row_ids.iter().copied().collect())
+        })
     }
 }
