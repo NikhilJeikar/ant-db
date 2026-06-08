@@ -47,6 +47,7 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Database {
+    pub name: String,
     #[serde(
         serialize_with = "serialize_tables",
         deserialize_with = "deserialize_tables"
@@ -61,13 +62,39 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(internal_state_manager: Arc<RwLock<InternalStateManager>>) -> Self {
+    pub fn new(name: String, internal_state_manager: Arc<RwLock<InternalStateManager>>) -> Self {
         Database {
+            name,
             tables: BTreeMap::new(),
             next_table_id: AtomicU64::new(0),
             internal_state_manager,
             transaction_snapshot: Arc::new(RwLock::new(TransactionSnapshot::default())),
             next_transaction_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn bind_tables(&mut self) {
+        for table in self.tables.values() {
+            if let Ok(mut table) = table.write() {
+                table.bind_page_store(&self.name);
+            }
+        }
+    }
+
+    fn persist_all_dirty_pages(&self) {
+        for table in self.tables.values() {
+            if let Ok(table) = table.read() {
+                if let Err(err) = table.persist_dirty_pages() {
+                    error!(
+                        "Failed to persist dirty pages for table '{}': {err}",
+                        table.name()
+                    );
+                }
+            }
         }
     }
 
@@ -78,6 +105,7 @@ impl Database {
                 table_name.clone(),
                 Arc::new(RwLock::new(Table::new(
                     table_id,
+                    self.name.clone(),
                     table_name.clone(),
                     self.internal_state_manager.clone(),
                 ))),
@@ -151,6 +179,7 @@ impl Database {
                 .unwrap()
                 .clone();
         }
+        self.persist_all_dirty_pages();
     }
 
     pub fn rollback_transaction(&mut self, transaction: &Transaction) {
@@ -204,5 +233,75 @@ impl Database {
                     .smallest_active_transaction_id,
             );
         }
+    }
+
+    pub fn auto_vacuum(&mut self) {
+        self.remove_stray_tables();
+        for table in self.tables.values() {
+            if let Ok(table) = table.read() {
+                if let Err(err) = table.flush_all_pages() {
+                    error!(
+                        "Failed to flush table '{}' during auto vacuum: {err}",
+                        table.name()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, RwLock};
+
+    use ahash::AHashMap;
+
+    use crate::backend::config::{Config, InternalStateManager};
+    use crate::backend::core::column::DataBaseDataType;
+    use crate::backend::core::row::DataBaseDataEntry;
+
+    use super::Database;
+
+    #[test]
+    fn dirty_pages_are_written_on_commit() {
+        let dir = std::env::temp_dir().join(format!("ant-db-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        table
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let mut data = AHashMap::new();
+        data.insert(0, DataBaseDataEntry::IntegerU64(42));
+        table.read().unwrap().insert_row(data, &txn).unwrap();
+        db.commit_transaction(txn.transaction_id);
+
+        let expected = dir.join("testdb-users");
+        assert!(
+            expected.exists(),
+            "expected table page file at {}",
+            expected.display()
+        );
+        assert!(expected.metadata().unwrap().len() > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

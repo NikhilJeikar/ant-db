@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use ahash::AHashMap;
 use ordered_float::NotNan;
@@ -94,11 +95,14 @@ impl SearchExpression {
         identifier.to_ascii_lowercase()
     }
 
-    fn resolve_value(
+    fn resolve_value<S>(
         &self,
-        row: &AHashMap<u16, DataBaseDataEntry>,
+        row: &AHashMap<u16, DataBaseDataEntry, S>,
         column_map: &HashMap<String, u16>,
-    ) -> Result<DecodedData, DataBaseErrors> {
+    ) -> Result<DecodedData, DataBaseErrors>
+    where
+        S: BuildHasher,
+    {
         match self {
             SearchExpression::Literal(value) => Ok(value.clone()),
             SearchExpression::Column(name) => {
@@ -134,11 +138,14 @@ impl SearchExpression {
         }
     }
 
-    pub fn evaluate(
+    pub fn evaluate<S>(
         &self,
-        row: &AHashMap<u16, DataBaseDataEntry>,
+        row: &AHashMap<u16, DataBaseDataEntry, S>,
         column_map: &HashMap<String, u16>,
-    ) -> Result<bool, DataBaseErrors> {
+    ) -> Result<bool, DataBaseErrors>
+    where
+        S: BuildHasher,
+    {
         match self {
             SearchExpression::Literal(value) => self.to_boolean(value),
             SearchExpression::Column(_) => {

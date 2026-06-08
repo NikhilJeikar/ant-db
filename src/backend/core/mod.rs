@@ -1,4 +1,5 @@
 pub mod database;
+pub mod page_store;
 pub mod table;
 pub mod types;
 pub mod row;

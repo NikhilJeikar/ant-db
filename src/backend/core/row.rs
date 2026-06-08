@@ -1,13 +1,42 @@
 use ahash::AHashMap;
+use nohash_hasher::BuildNoHashHasher;
 use ordered_float::NotNan;
-use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
-use twox_hash::XxHash64;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::hash::{BuildHasher, Hash};
 
-use crate::backend::core::column::{ColumnID, DataBaseDataType, HashType};
+use crate::backend::core::column::{ColumnID, DataBaseDataType};
 use crate::backend::core::transaction::{Transaction, TransactionHeader, TransactionID};
 
 pub type RowID = u64;
+pub type RowData = AHashMap<ColumnID, DataBaseDataEntry, BuildNoHashHasher<ColumnID>>;
+
+fn serialize_row_data<S>(data: &RowData, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let ordered: BTreeMap<ColumnID, &DataBaseDataEntry> = data.iter().map(|(&k, v)| (k, v)).collect();
+    ordered.serialize(serializer)
+}
+
+fn deserialize_row_data<'de, D>(deserializer: D) -> Result<RowData, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let intermediate = BTreeMap::<ColumnID, DataBaseDataEntry>::deserialize(deserializer)?;
+    let mut row_data = AHashMap::with_hasher(BuildNoHashHasher::default());
+    row_data.extend(intermediate.into_iter());
+    Ok(row_data)
+}
+
+fn row_data_from_map<S>(data: AHashMap<ColumnID, DataBaseDataEntry, S>) -> RowData
+where
+    S: BuildHasher,
+{
+    let mut row_data = AHashMap::with_hasher(BuildNoHashHasher::default());
+    row_data.extend(data);
+    row_data
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub enum DataBaseDataEntry {
@@ -55,11 +84,53 @@ impl DataBaseDataEntry {
         }
     }
 
-    pub fn key(&self, column_id: ColumnID) -> HashType {
-        let mut hasher = XxHash64::with_seed(0);
-        column_id.hash(&mut hasher);
-        self.hash(&mut hasher);
-        hasher.finish()
+    pub fn key(&self, _column_id: ColumnID) -> u64 {
+        match self {
+            DataBaseDataEntry::Null => 0,
+            DataBaseDataEntry::IntegerU8(value) => *value as u64,
+            DataBaseDataEntry::IntegerU16(value) => *value as u64,
+            DataBaseDataEntry::IntegerU32(value) => *value as u64,
+            DataBaseDataEntry::IntegerU64(value) => *value,
+            DataBaseDataEntry::IntegerU128(value) => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hasher;
+
+                let mut hasher = DefaultHasher::new();
+                value.hash(&mut hasher);
+                hasher.finish()
+            }
+            DataBaseDataEntry::IntegerI8(value) => *value as u64,
+            DataBaseDataEntry::IntegerI16(value) => *value as u64,
+            DataBaseDataEntry::IntegerI32(value) => *value as u64,
+            DataBaseDataEntry::IntegerI64(value) => *value as u64,
+            DataBaseDataEntry::IntegerI128(value) => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hasher;
+
+                let mut hasher = DefaultHasher::new();
+                value.hash(&mut hasher);
+                hasher.finish()
+            }
+            DataBaseDataEntry::FloatF32(value) => value.into_inner().to_bits() as u64,
+            DataBaseDataEntry::FloatF64(value) => value.into_inner().to_bits(),
+            DataBaseDataEntry::String(value) => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hasher;
+
+                let mut hasher = DefaultHasher::new();
+                value.hash(&mut hasher);
+                hasher.finish()
+            }
+            DataBaseDataEntry::Boolean(value) => *value as u64,
+            DataBaseDataEntry::Bytes(value) => {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::Hasher;
+
+                let mut hasher = DefaultHasher::new();
+                value.hash(&mut hasher);
+                hasher.finish()
+            }
+        }
     }
 
     pub fn is_null(&self) -> bool {
@@ -70,7 +141,8 @@ impl DataBaseDataEntry {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct InternalRow {
     pub transaction_header: TransactionHeader,
-    pub data: AHashMap<ColumnID, DataBaseDataEntry>,
+    #[serde(serialize_with = "serialize_row_data", deserialize_with = "deserialize_row_data")]
+    pub data: RowData,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -79,17 +151,21 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn new(
+    pub fn new<S>(
         transaction: &Transaction,
-        data: AHashMap<ColumnID, DataBaseDataEntry>,
-    ) -> Self {
+        data: AHashMap<ColumnID, DataBaseDataEntry, S>,
+    ) -> Self
+    where
+        S: BuildHasher,
+    {
+        let row_data = row_data_from_map(data);
         let mut row = Row { versions: Vec::new() };
         row.versions.push(InternalRow {
             transaction_header: TransactionHeader {
                 created_by: transaction.transaction_id,
                 deleted_by: None,
             },
-            data,
+            data: row_data,
         });
         row
     }
@@ -103,11 +179,13 @@ impl Row {
         }
     }
 
-    pub fn update(
+    pub fn update<S>(
         &mut self,
         transaction: &Transaction,
-        data: AHashMap<ColumnID, DataBaseDataEntry>,
-    ) {
+        data: AHashMap<ColumnID, DataBaseDataEntry, S>,
+    ) where
+        S: BuildHasher,
+    {
         for row in self.versions.iter_mut().rev() {
             if row.transaction_header.is_visible(transaction) {
                 row.transaction_header.deleted_by = Some(transaction.transaction_id);
@@ -120,7 +198,7 @@ impl Row {
                 created_by: transaction.transaction_id,
                 deleted_by: None,
             },
-            data,
+            data: row_data_from_map(data),
         });
     }
 
