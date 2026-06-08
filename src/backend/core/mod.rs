@@ -6,4 +6,7 @@ pub mod row;
 pub mod column;
 pub mod transaction;
 pub mod search;
+pub mod plan;
+pub mod query;
+pub mod copy;
 pub mod pg_wire;

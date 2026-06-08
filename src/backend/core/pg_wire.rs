@@ -11,38 +11,41 @@ use sqlparser::ast::{
     AlterTableOperation,
     ColumnOption,
     ColumnOptionDef,
+    CopySource,
+    CopyTarget,
     DataType,
     Expr as SqlExpr,
-    FromTable,
     Ident,
+    ObjectName,
     ObjectType,
-    SetExpr,
+    OrderByExpr,
     ShowStatementFilter,
     Statement,
     TableConstraint,
-    TableFactor,
-    UnaryOperator,
-    Value as SqlValue,
 };
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
 use tokio::net::TcpListener;
 
+use bytes::Bytes;
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::copy::NoopCopyHandler;
+use pgwire::api::copy::{send_copy_out_response, CopyHandler};
 use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::results::{CopyResponse, DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::response::NoticeResponse;
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
+use pgwire::messages::response::{CommandComplete, NoticeResponse};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 
-use crate::backend::core::column::ColumnID;
+use crate::backend::core::column::{ColumnID, Constraint};
+use crate::backend::core::copy::{
+    append_copy_data, encode_copy_payload, parse_copy_options, parse_copy_rows, resolve_copy_columns,
+    CopyColumnSpec, CopyOptions,
+};
 use crate::backend::core::database::Database;
+use crate::backend::core::plan::{self, ExecutionResult};
 use crate::backend::core::row::DataBaseDataEntry;
-use crate::backend::core::search::SearchRequest;
-use crate::backend::core::table::Table;
+use crate::backend::core::table::{Table, TableID};
 use crate::backend::core::transaction::Transaction;
 use crate::backend::errors::DataBaseErrors;
 
@@ -50,106 +53,21 @@ fn normalize_identifier(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
 
-fn parse_sql_value(value: &SqlValue) -> Result<DataBaseDataEntry, DataBaseErrors> {
-    match value {
-        SqlValue::Number(text, _) => {
-            if text.contains('.') || text.contains('e') || text.contains('E') {
-                let float = text.parse::<f64>().map_err(|err| {
-                    DataBaseErrors::QueryError(format!(
-                        "Unable to parse numeric literal '{text}': {err}",
-                    ))
-                })?;
-                Ok(DataBaseDataEntry::FloatF64(NotNan::new(float).map_err(|_| {
-                    DataBaseErrors::QueryError("Floating point literal must not be NaN".into())
-                })?))
-            } else if let Ok(unsigned) = text.parse::<u64>() {
-                Ok(DataBaseDataEntry::IntegerU64(unsigned))
-            } else if let Ok(signed) = text.parse::<i64>() {
-                Ok(DataBaseDataEntry::IntegerI64(signed))
-            } else if let Ok(unsigned128) = text.parse::<u128>() {
-                Ok(DataBaseDataEntry::IntegerU128(unsigned128))
-            } else if let Ok(signed128) = text.parse::<i128>() {
-                Ok(DataBaseDataEntry::IntegerI128(signed128))
-            } else {
-                Err(DataBaseErrors::QueryError(format!(
-                    "Numeric literal '{text}' is too large or invalid",
-                )))
-            }
-        }
-        SqlValue::SingleQuotedString(value) => Ok(DataBaseDataEntry::String(value.clone())),
-        SqlValue::Boolean(flag) => Ok(DataBaseDataEntry::Boolean(*flag)),
-        SqlValue::Null => Ok(DataBaseDataEntry::Null),
-        _ => Err(DataBaseErrors::QueryError(format!(
-            "Unsupported literal value in INSERT/UPDATE statement: {value:?}",
-        ))),
+fn normalize_simple_query(query: &str) -> String {
+    let query = query.trim().trim_end_matches('\0');
+    if query.ends_with(';') {
+        return query.to_string();
     }
-}
 
-fn parse_sql_literal(expr: &SqlExpr) -> Result<DataBaseDataEntry, DataBaseErrors> {
-    match expr {
-        SqlExpr::Value(value) => parse_sql_value(value),
-        SqlExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-            let literal = parse_sql_literal(expr)?;
-            match literal {
-                DataBaseDataEntry::IntegerU64(value) => Ok(DataBaseDataEntry::IntegerI64(-(value as i64))),
-                DataBaseDataEntry::IntegerI64(value) => Ok(DataBaseDataEntry::IntegerI64(-value)),
-                DataBaseDataEntry::IntegerU128(value) => Ok(DataBaseDataEntry::IntegerI128(-(value as i128))),
-                DataBaseDataEntry::IntegerI128(value) => Ok(DataBaseDataEntry::IntegerI128(-value)),
-                DataBaseDataEntry::FloatF64(value) => Ok(DataBaseDataEntry::FloatF64(NotNan::new(-value.into_inner()).map_err(|_| {
-                    DataBaseErrors::QueryError("Floating point literal must not be NaN".into())
-                })?)),
-                _ => Err(DataBaseErrors::QueryError(
-                    "Only numeric literals support unary minus in INSERT/UPDATE.".into(),
-                )),
-            }
-        }
-        SqlExpr::Nested(expr) => parse_sql_literal(expr),
-        _ => Err(DataBaseErrors::QueryError(
-            "Only literal expressions are supported in INSERT/UPDATE values".into(),
-        )),
-    }
-}
-
-fn build_insert_data(
-    table: &Table,
-    transaction: &Transaction,
-    requested_columns: &[Ident],
-    values: &[SqlExpr],
-) -> Result<AHashMap<ColumnID, DataBaseDataEntry>, DataBaseErrors> {
-    let visible_column_map = table.get_visible_column_map(transaction)?;
-
-    let insert_column_names: Vec<String> = if !requested_columns.is_empty() {
-        requested_columns
-            .iter()
-            .map(|identifier| normalize_identifier(&identifier.value))
-            .collect()
+    let upper = query.to_ascii_uppercase();
+    if upper.contains(" FROM STDIN")
+        && !upper.contains(" TO ")
+        && upper.starts_with("COPY ")
+    {
+        format!("{query};")
     } else {
-        let mut columns: Vec<(String, ColumnID)> = visible_column_map
-            .iter()
-            .map(|(name, id)| (name.clone(), *id))
-            .collect();
-        columns.sort_by_key(|(_, id)| *id);
-        columns.into_iter().map(|(name, _)| name).collect()
-    };
-
-    if insert_column_names.len() != values.len() {
-        return Err(DataBaseErrors::QueryError(format!(
-            "INSERT column count {} does not match value count {}",
-            insert_column_names.len(),
-            values.len()
-        )));
+        query.to_string()
     }
-
-    let mut row_data = AHashMap::new();
-    for (column_name, expr) in insert_column_names.iter().zip(values.iter()) {
-        let column_id = visible_column_map
-            .get(column_name)
-            .ok_or_else(|| DataBaseErrors::QueryError(format!("Column '{}' not found", column_name)))?;
-        let value = parse_sql_literal(expr)?;
-        row_data.insert(*column_id, value);
-    }
-
-    Ok(row_data)
 }
 
 fn sql_like_matches(value: &str, pattern: &str, case_insensitive: bool) -> bool {
@@ -189,6 +107,25 @@ fn parse_table_name(name: &sqlparser::ast::ObjectName) -> Result<String, DataBas
         Some(ident) => Ok(normalize_identifier(&ident.value)),
         None => Err(DataBaseErrors::QueryError(
             "Missing table name in SQL statement".into(),
+        )),
+    }
+}
+
+fn parse_index_name(name: &sqlparser::ast::ObjectName) -> Result<String, DataBaseErrors> {
+    parse_table_name(name)
+}
+
+fn parse_index_column(column: &OrderByExpr) -> Result<String, DataBaseErrors> {
+    match &column.expr {
+        SqlExpr::Identifier(ident) => Ok(normalize_identifier(&ident.value)),
+        SqlExpr::CompoundIdentifier(idents) => match idents.last() {
+            Some(ident) => Ok(normalize_identifier(&ident.value)),
+            None => Err(DataBaseErrors::QueryError(
+                "Missing column name in CREATE INDEX".into(),
+            )),
+        },
+        _ => Err(DataBaseErrors::QueryError(
+            "CREATE INDEX supports only simple column references".into(),
         )),
     }
 }
@@ -233,21 +170,59 @@ fn parse_create_table_data_type(
     })
 }
 
+fn parse_table_name_from_object(name: &ObjectName) -> Result<String, DataBaseErrors> {
+    name.0
+        .last()
+        .map(|ident| normalize_identifier(&ident.value))
+        .ok_or_else(|| DataBaseErrors::QueryError("Missing table name in foreign key".into()))
+}
+
+fn resolve_foreign_key_reference(
+    db: &Database,
+    foreign_table: &ObjectName,
+    referred_columns: &[Ident],
+    transaction: &Transaction,
+) -> Result<(TableID, ColumnID), DataBaseErrors> {
+    if referred_columns.len() != 1 {
+        return Err(DataBaseErrors::QueryError(
+            "Composite foreign keys are not supported".into(),
+        ));
+    }
+
+    let table_name = parse_table_name_from_object(foreign_table)?;
+    let column_name = normalize_identifier(&referred_columns[0].value);
+    let table = db
+        .get_table(table_name.clone())
+        .ok_or_else(|| DataBaseErrors::TableNotFound(table_name))?;
+    let table_guard = table
+        .read()
+        .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
+    let column_map = table_guard.get_visible_column_map(transaction)?;
+    let column_id = column_map.get(&column_name).copied().ok_or_else(|| {
+        DataBaseErrors::QueryError(format!(
+            "Foreign key references unknown column '{column_name}'",
+        ))
+    })?;
+    Ok((table_guard.table_id(), column_id))
+}
+
 fn parse_column_constraints(
     options: &[ColumnOptionDef],
-) -> Result<BTreeSet<crate::backend::core::column::Constraint>, DataBaseErrors> {
+    db: &Database,
+    transaction: &Transaction,
+) -> Result<BTreeSet<Constraint>, DataBaseErrors> {
     let mut constraints = BTreeSet::new();
     for option in options {
         match &option.option {
             ColumnOption::NotNull => {
-                constraints.insert(crate::backend::core::column::Constraint::NotNull);
+                constraints.insert(Constraint::NotNull);
             }
             ColumnOption::Null => {}
             ColumnOption::Unique { is_primary, .. } => {
                 if *is_primary {
-                    constraints.insert(crate::backend::core::column::Constraint::PrimaryKey);
+                    constraints.insert(Constraint::PrimaryKey);
                 } else {
-                    constraints.insert(crate::backend::core::column::Constraint::Unique);
+                    constraints.insert(Constraint::Unique);
                 }
             }
             ColumnOption::DialectSpecific(tokens) => {
@@ -257,7 +232,7 @@ fn parse_column_constraints(
                     .collect::<Vec<_>>()
                     .join(" ");
                 if text == "auto_increment" || text == "autoincrement" {
-                    constraints.insert(crate::backend::core::column::Constraint::AutoIncrement);
+                    constraints.insert(Constraint::AutoIncrement);
                 } else {
                     return Err(DataBaseErrors::QueryError(format!(
                         "Unsupported dialect-specific column option: {text}",
@@ -269,15 +244,20 @@ fn parse_column_constraints(
                     "DEFAULT expressions are unsupported in CREATE TABLE".into(),
                 ));
             }
-            ColumnOption::ForeignKey { .. } => {
-                return Err(DataBaseErrors::QueryError(
-                    "Foreign key constraints are unsupported".into(),
-                ));
+            ColumnOption::ForeignKey {
+                foreign_table,
+                referred_columns,
+                ..
+            } => {
+                let (refered_table_id, refered_column_id) =
+                    resolve_foreign_key_reference(db, foreign_table, referred_columns, transaction)?;
+                constraints.insert(Constraint::ForeignKey {
+                    refered_table_id,
+                    refered_column_id,
+                });
             }
             ColumnOption::Check(_) => {
-                return Err(DataBaseErrors::QueryError(
-                    "CHECK constraints are unsupported".into(),
-                ));
+                constraints.insert(Constraint::Check);
             }
             ColumnOption::Generated { .. } => {
                 return Err(DataBaseErrors::QueryError(
@@ -298,8 +278,10 @@ fn parse_column_constraints(
 fn build_table_constraint_map(
     constraints: &[TableConstraint],
     column_name_map: &HashMap<String, ColumnID>,
-) -> Result<HashMap<ColumnID, BTreeSet<crate::backend::core::column::Constraint>>, DataBaseErrors> {
-    let mut column_constraints: HashMap<ColumnID, BTreeSet<crate::backend::core::column::Constraint>> = HashMap::new();
+    db: &Database,
+    transaction: &Transaction,
+) -> Result<HashMap<ColumnID, BTreeSet<Constraint>>, DataBaseErrors> {
+    let mut column_constraints: HashMap<ColumnID, BTreeSet<Constraint>> = HashMap::new();
     for constraint in constraints {
         match constraint {
             TableConstraint::Unique { columns, .. } => {
@@ -314,7 +296,7 @@ fn build_table_constraint_map(
                     column_constraints
                         .entry(*column_id)
                         .or_default()
-                        .insert(crate::backend::core::column::Constraint::Unique);
+                        .insert(Constraint::Unique);
                 }
             }
             TableConstraint::PrimaryKey { columns, .. } => {
@@ -329,8 +311,40 @@ fn build_table_constraint_map(
                     column_constraints
                         .entry(*column_id)
                         .or_default()
-                        .insert(crate::backend::core::column::Constraint::PrimaryKey);
+                        .insert(Constraint::PrimaryKey);
                 }
+            }
+            TableConstraint::ForeignKey {
+                columns,
+                foreign_table,
+                referred_columns,
+                ..
+            } => {
+                if columns.len() != 1 {
+                    return Err(DataBaseErrors::QueryError(
+                        "Composite foreign keys are not supported".into(),
+                    ));
+                }
+                let local_name = normalize_identifier(&columns[0].value);
+                let local_id = column_name_map.get(&local_name).ok_or_else(|| {
+                    DataBaseErrors::QueryError(format!(
+                        "Unknown column '{local_name}' in FOREIGN KEY table constraint",
+                    ))
+                })?;
+                let (refered_table_id, refered_column_id) =
+                    resolve_foreign_key_reference(db, foreign_table, referred_columns, transaction)?;
+                column_constraints
+                    .entry(*local_id)
+                    .or_default()
+                    .insert(Constraint::ForeignKey {
+                        refered_table_id,
+                        refered_column_id,
+                    });
+            }
+            TableConstraint::Check { .. } => {
+                return Err(DataBaseErrors::QueryError(
+                    "Table-level CHECK constraints are not supported; use a column CHECK".into(),
+                ));
             }
             _ => {
                 return Err(DataBaseErrors::QueryError(
@@ -352,9 +366,19 @@ fn show_tables_matches(name: &str, filter: &ShowStatementFilter) -> Result<bool,
     }
 }
 
+struct CopySession {
+    table_name: String,
+    columns: Vec<CopyColumnSpec>,
+    options: CopyOptions,
+    buffer: Vec<u8>,
+    transaction: Transaction,
+    auto_commit: bool,
+}
+
 pub struct PgWireHandler {
     pub db: Arc<RwLock<Database>>,
     pub active_transactions: Arc<RwLock<HashMap<SocketAddr, Transaction>>>,
+    copy_sessions: Arc<RwLock<HashMap<SocketAddr, CopySession>>>,
 }
 
 impl NoopStartupHandler for PgWireHandler {}
@@ -448,6 +472,94 @@ impl PgWireHandler {
 
         result
     }
+
+    fn begin_copy_transaction<C>(&self, client: &C) -> Result<(Transaction, bool), DataBaseErrors>
+    where
+        C: ClientInfo,
+    {
+        if let Some(transaction) = self.connection_transaction(client) {
+            return Ok((transaction, false));
+        }
+
+        let mut db = self.db.write().unwrap();
+        let transaction = db.create_transaction();
+        Ok((transaction, true))
+    }
+
+    fn finish_copy_transaction(
+        &self,
+        transaction: &Transaction,
+        auto_commit: bool,
+        success: bool,
+    ) {
+        if !auto_commit {
+            return;
+        }
+
+        let mut db = self.db.write().unwrap();
+        if success {
+            db.commit_transaction(transaction.transaction_id);
+        } else {
+            db.rollback_transaction(transaction);
+        }
+    }
+
+    async fn send_query_error<C>(
+        &self,
+        client: &mut C,
+        message: String,
+    ) -> PgWireResult<Vec<Response<'static>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        client
+            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), message),
+            )))
+            .await?;
+        Ok(vec![Response::Execution(Tag::new("ERROR"))])
+    }
+
+    fn run_query_pipeline<C>(
+        &self,
+        client: &C,
+        statement: Statement,
+    ) -> Result<ExecutionResult, DataBaseErrors>
+    where
+        C: ClientInfo,
+    {
+        self.execute_transactional(client, |transaction| {
+            let db_read = self.db.read().unwrap();
+            plan::plan_and_execute(&db_read, statement, transaction, |table_id, column_id, value| {
+                let db = self.db.read().unwrap();
+                db.foreign_key_value_exists(table_id, column_id, value, transaction)
+            })
+        })
+    }
+
+    async fn respond_planned_error<C>(
+        &self,
+        client: &mut C,
+        err: DataBaseErrors,
+    ) -> PgWireResult<Vec<Response<'static>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (code, message) = match &err {
+            DataBaseErrors::TableNotFound(name) => ("42P01", format!("Table '{name}' not found")),
+            _ => ("42601", err.to_string()),
+        };
+        client
+            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                ErrorInfo::new("ERROR".to_owned(), code.to_owned(), message),
+            )))
+            .await?;
+        Ok(vec![Response::Execution(Tag::new("ERROR"))])
+    }
 }
 
 #[async_trait]
@@ -462,7 +574,7 @@ impl SimpleQueryHandler for PgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let query = query.trim();
+        let query = normalize_simple_query(query);
         client
             .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
                 ErrorInfo::new(
@@ -473,8 +585,7 @@ impl SimpleQueryHandler for PgWireHandler {
             )))
             .await?;
 
-        let dialect = PostgreSqlDialect {};
-        let statements = match Parser::parse_sql(&dialect, query) {
+        let statements = match plan::parse_sql(&query) {
             Ok(statements) => statements,
             Err(err) => {
                 client
@@ -608,7 +719,8 @@ impl SimpleQueryHandler for PgWireHandler {
                     for column_def in &create_table.columns {
                         let column_name = normalize_identifier(&column_def.name.value);
                         let data_type = parse_create_table_data_type(&column_def.data_type)?;
-                        let constraints = parse_column_constraints(&column_def.options)?;
+                        let constraints =
+                            parse_column_constraints(&column_def.options, &db, &transaction)?;
                         let column_id = table_write.create_column(
                             column_name.clone(),
                             data_type,
@@ -618,7 +730,12 @@ impl SimpleQueryHandler for PgWireHandler {
                         column_name_map.insert(column_name, column_id);
                     }
 
-                    let table_constraint_map = build_table_constraint_map(&create_table.constraints, &column_name_map)?;
+                    let table_constraint_map = build_table_constraint_map(
+                        &create_table.constraints,
+                        &column_name_map,
+                        &db,
+                        &transaction,
+                    )?;
                     for (column_id, extra_constraints) in table_constraint_map {
                         table_write.add_column_constraints(column_id, extra_constraints, &transaction)?;
                     }
@@ -664,12 +781,219 @@ impl SimpleQueryHandler for PgWireHandler {
                     }
                 }
             }
+            Statement::CreateIndex(create_index) => {
+                if create_index.unique {
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                            ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "42601".to_owned(),
+                                "CREATE UNIQUE INDEX is unsupported; use UNIQUE or PRIMARY KEY constraints".to_owned(),
+                            ),
+                        )))
+                        .await?;
+                    return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                }
+                if create_index.concurrently {
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                            ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "42601".to_owned(),
+                                "CREATE INDEX CONCURRENTLY is unsupported".to_owned(),
+                            ),
+                        )))
+                        .await?;
+                    return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                }
+                if create_index.columns.len() != 1 {
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                            ErrorInfo::new(
+                                "ERROR".to_owned(),
+                                "42601".to_owned(),
+                                "CREATE INDEX supports only a single column".to_owned(),
+                            ),
+                        )))
+                        .await?;
+                    return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                }
+
+                let table_name = match parse_table_name(&create_index.table_name) {
+                    Ok(name) => name,
+                    Err(err) => {
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), format!("{}", err)),
+                            )))
+                            .await?;
+                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    }
+                };
+                let column_name = match parse_index_column(&create_index.columns[0]) {
+                    Ok(name) => name,
+                    Err(err) => {
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), format!("{}", err)),
+                            )))
+                            .await?;
+                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    }
+                };
+                let index_name = match create_index.name.as_ref() {
+                    Some(name) => match parse_index_name(name) {
+                        Ok(name) => Some(name),
+                        Err(err) => {
+                            client
+                                .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), format!("{}", err)),
+                                )))
+                                .await?;
+                            return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                        }
+                    },
+                    None => None,
+                };
+
+                let result = self.execute_transactional(client, |transaction| {
+                    let table_ref = {
+                        let db_read = self.db.read().unwrap();
+                        db_read.get_table(table_name.clone())
+                    };
+                    let table = match table_ref {
+                        Some(table) => table,
+                        None => return Err(DataBaseErrors::TableNotFound(table_name.clone())),
+                    };
+                    let mut table_write = table.write().unwrap();
+                    if create_index.if_not_exists
+                        && table_write.is_column_indexed(&column_name, transaction)?
+                    {
+                        return Ok(());
+                    }
+                    table_write.create_column_index(index_name, &column_name, transaction)?;
+                    Ok(())
+                });
+
+                match result {
+                    Ok(_) => return Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))]),
+                    Err(DataBaseErrors::TableNotFound(name)) => {
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42P01".to_owned(),
+                                    format!("Table '{}' not found", name),
+                                ),
+                            )))
+                            .await?;
+                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    }
+                    Err(err) => {
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42601".to_owned(),
+                                    format!("{}", err),
+                                ),
+                            )))
+                            .await?;
+                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    }
+                }
+            }
             Statement::Drop {
                 object_type,
                 if_exists,
                 names,
                 ..
             } => {
+                if object_type == ObjectType::Index {
+                    if names.len() != 1 {
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                ErrorInfo::new(
+                                    "ERROR".to_owned(),
+                                    "42601".to_owned(),
+                                    "DROP INDEX supports only one index name".to_owned(),
+                                ),
+                            )))
+                            .await?;
+                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    }
+
+                    let index_name = match parse_index_name(&names[0]) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            client
+                                .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                    ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), format!("{}", err)),
+                                )))
+                                .await?;
+                            return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                        }
+                    };
+
+                    let result = self.execute_transactional(client, |transaction| {
+                        let tables: Vec<_> = {
+                            let db_read = self.db.read().unwrap();
+                            db_read.tables.values().cloned().collect()
+                        };
+                        let mut dropped = false;
+                        let mut last_err: Option<DataBaseErrors> = None;
+                        for table in tables {
+                            let mut table_write = table.write().unwrap();
+                            match table_write.drop_column_index(&index_name, transaction) {
+                                Ok(()) => {
+                                    dropped = true;
+                                    break;
+                                }
+                                Err(DataBaseErrors::IndexNotFound(_)) => {}
+                                Err(err) => last_err = Some(err),
+                            }
+                        }
+                        if dropped {
+                            return Ok(());
+                        }
+                        if if_exists {
+                            return Ok(());
+                        }
+                        if let Some(err) = last_err {
+                            return Err(err);
+                        }
+                        Err(DataBaseErrors::IndexNotFound(index_name.clone()))
+                    });
+
+                    match result {
+                        Ok(_) => return Ok(vec![Response::Execution(Tag::new("DROP INDEX"))]),
+                        Err(DataBaseErrors::IndexNotFound(name)) => {
+                            client
+                                .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                    ErrorInfo::new(
+                                        "ERROR".to_owned(),
+                                        "42704".to_owned(),
+                                        format!("Index '{}' not found", name),
+                                    ),
+                                )))
+                                .await?;
+                            return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                        }
+                        Err(err) => {
+                            client
+                                .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                                    ErrorInfo::new(
+                                        "ERROR".to_owned(),
+                                        "42601".to_owned(),
+                                        format!("{}", err),
+                                    ),
+                                )))
+                                .await?;
+                            return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                        }
+                    }
+                }
+
                 if object_type != ObjectType::Table {
                     client
                         .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
@@ -890,410 +1214,261 @@ impl SimpleQueryHandler for PgWireHandler {
                 }
             }
             Statement::Delete(delete) => {
-                let result = self.execute_transactional(client, |transaction| {
-                    if !delete.order_by.is_empty() {
-                        return Err(DataBaseErrors::QueryError(
-                            "DELETE ORDER BY is unsupported".into(),
-                        ));
+                match self.run_query_pipeline(client, Statement::Delete(delete)) {
+                    Ok(ExecutionResult::RowsAffected { tag, .. }) => {
+                        return Ok(vec![Response::Execution(Tag::new(tag))]);
                     }
-                    if delete.limit.is_some() {
-                        return Err(DataBaseErrors::QueryError(
-                            "DELETE LIMIT is unsupported".into(),
-                        ));
+                    Ok(_) => {
+                        return self
+                            .send_query_error(client, "Unexpected DELETE pipeline result".to_string())
+                            .await;
                     }
-                    if delete.using.is_some() {
-                        return Err(DataBaseErrors::QueryError(
-                            "DELETE USING is unsupported".into(),
-                        ));
-                    }
-
-                    let table_name = if !delete.tables.is_empty() {
-                        match delete.tables[0].0.last() {
-                            Some(ident) => normalize_identifier(&ident.value),
-                            None => {
-                                return Err(DataBaseErrors::QueryError(
-                                    "Missing DELETE table name".into(),
-                                ));
-                            }
-                        }
-                    } else {
-                        match &delete.from {
-                            FromTable::WithFromKeyword(tables)
-                            | FromTable::WithoutKeyword(tables) => {
-                                if tables.len() != 1 {
-                                    return Err(DataBaseErrors::QueryError(
-                                        "DELETE supports exactly one target table".into(),
-                                    ));
-                                }
-                                match &tables[0].relation {
-                                    TableFactor::Table { name, .. } => match name.0.last() {
-                                        Some(ident) => normalize_identifier(&ident.value),
-                                        None => {
-                                            return Err(DataBaseErrors::QueryError(
-                                                "Missing DELETE table name".into(),
-                                            ));
-                                        }
-                                    },
-                                    _ => {
-                                        return Err(DataBaseErrors::QueryError(
-                                            "Unsupported DELETE target".into(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    };
-
-                    let table_ref = {
-                        let db_read = self.db.read().unwrap();
-                        db_read.get_table(table_name.clone())
-                    };
-
-                    let table = match table_ref {
-                        Some(table) => table,
-                        None => return Err(DataBaseErrors::TableNotFound(table_name.clone())),
-                    };
-
-                    let _visible_columns = table.read().unwrap().get_visible_column_map(transaction)?;
-                    let filter = if let Some(selection) = delete.selection.as_ref() {
-                        Some(SearchRequest::parse_sql_expression(selection)?)
-                    } else {
-                        None
-                    };
-
-                    let search_request = SearchRequest {
-                        table_name: table_name.clone(),
-                        projection: None,
-                        filter,
-                        order_by: Vec::new(),
-                        limit: None,
-                        offset: None,
-                    };
-
-                    let rows = table.read().unwrap().search(&search_request, transaction)?;
-                    let mut deleted_count = 0;
-                    for row in rows {
-                        table.read().unwrap().delete_row(row.row_id, transaction)?;
-                        deleted_count += 1;
-                    }
-
-                    Ok(deleted_count)
-                });
-
-                match result {
-                    Ok(_) => return Ok(vec![Response::Execution(Tag::new("DELETE"))]),
-                    Err(DataBaseErrors::TableNotFound(name)) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42P01".to_owned(),
-                                    format!("Table '{}' not found", name),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
-                    Err(err) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42601".to_owned(),
-                                    format!("{}", err),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
+                    Err(err) => return self.respond_planned_error(client, err).await,
                 }
             }
             Statement::Insert(insert) => {
-                let table_name = match insert.table_name.0.last() {
-                    Some(ident) => normalize_identifier(&ident.value),
-                    None => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42601".to_owned(),
-                                    "Missing table name in INSERT statement".to_owned(),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                match self.run_query_pipeline(client, Statement::Insert(insert)) {
+                    Ok(ExecutionResult::RowsAffected { tag, .. }) => {
+                        return Ok(vec![Response::Execution(Tag::new(tag))]);
                     }
-                };
-
-                let result = self.execute_transactional(client, |transaction| {
-                    let table_ref = {
-                        let db_read = self.db.read().unwrap();
-                        db_read.get_table(table_name.clone())
-                    };
-
-                    let table = match table_ref {
-                        Some(table) => table,
-                        None => return Err(DataBaseErrors::TableNotFound(table_name.clone())),
-                    };
-
-                    let table_read = table.read().unwrap();
-                    let mut inserted_count = 0;
-                    let source_query = insert.source.ok_or_else(|| {
-                        DataBaseErrors::QueryError("INSERT source must be VALUES or query".into())
-                    })?;
-
-                    match source_query.body.as_ref() {
-                        SetExpr::Values(values) => {
-                            for row in values.rows.iter() {
-                                let row_data = build_insert_data(
-                                    &table_read,
-                                    transaction,
-                                    &insert.columns,
-                                    row,
-                                )?;
-                                table_read.insert_row(row_data, transaction)?;
-                                inserted_count += 1;
-                            }
-                        }
-                        _ => {
-                            return Err(DataBaseErrors::QueryError(
-                                "INSERT only supports VALUES sources".into(),
-                            ));
-                        }
+                    Ok(_) => {
+                        return self
+                            .send_query_error(client, "Unexpected INSERT pipeline result".to_string())
+                            .await;
                     }
-
-                    Ok(inserted_count)
-                });
-
-                match result {
-                    Ok(_) => return Ok(vec![Response::Execution(Tag::new("INSERT"))]),
-                    Err(DataBaseErrors::TableNotFound(name)) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42P01".to_owned(),
-                                    format!("Table '{}' not found", name),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
-                    Err(err) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42601".to_owned(),
-                                    format!("{}", err),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
+                    Err(err) => return self.respond_planned_error(client, err).await,
                 }
             }
             Statement::Update {
                 table,
                 assignments,
                 selection,
+                from,
+                returning,
+            } => {
+                match self.run_query_pipeline(
+                    client,
+                    Statement::Update {
+                        table,
+                        assignments,
+                        selection,
+                        from,
+                        returning,
+                    },
+                ) {
+                    Ok(ExecutionResult::RowsAffected { tag, .. }) => {
+                        return Ok(vec![Response::Execution(Tag::new(tag))]);
+                    }
+                    Ok(_) => {
+                        return self
+                            .send_query_error(client, "Unexpected UPDATE pipeline result".to_string())
+                            .await;
+                    }
+                    Err(err) => return self.respond_planned_error(client, err).await,
+                }
+            }
+            Statement::Copy {
+                source,
+                to,
+                target,
+                options,
+                legacy_options,
                 ..
             } => {
-                let table_name = match &table.relation {
-                    TableFactor::Table { name, .. } => match name.0.last() {
-                        Some(ident) => normalize_identifier(&ident.value),
-                        None => {
-                            client
-                                .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                    ErrorInfo::new(
-                                        "ERROR".to_owned(),
-                                        "42601".to_owned(),
-                                        "Missing table name in UPDATE statement".to_owned(),
-                                    ),
-                                )))
-                                .await?;
-                            return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                        }
-                    },
-                    _ => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42601".to_owned(),
-                                    "Unsupported UPDATE target".to_owned(),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
+                if !legacy_options.is_empty() {
+                    return self
+                        .send_query_error(
+                            client,
+                            "Legacy COPY options are not supported; use WITH (...)".to_string(),
+                        )
+                        .await;
+                }
+
+                let copy_options = match parse_copy_options(&options) {
+                    Ok(options) => options,
+                    Err(err) => return self.send_query_error(client, err.to_string()).await,
                 };
 
-                let result = self.execute_transactional(client, |transaction| {
-                    let table_ref = {
-                        let db_read = self.db.read().unwrap();
-                        db_read.get_table(table_name.clone())
-                    };
+                if copy_options.binary {
+                    return self
+                        .send_query_error(client, "COPY binary format is not supported".to_string())
+                        .await;
+                }
 
-                    let table = match table_ref {
-                        Some(table) => table,
-                        None => return Err(DataBaseErrors::TableNotFound(table_name.clone())),
-                    };
+                match (to, &target) {
+                    (false, CopyTarget::Stdin) => {
+                        let (table_name, requested_columns) = match &source {
+                            CopySource::Table { table_name, columns } => {
+                                match parse_table_name(table_name) {
+                                    Ok(name) => (name, columns.as_slice()),
+                                    Err(err) => {
+                                        return self.send_query_error(client, err.to_string()).await;
+                                    }
+                                }
+                            }
+                            CopySource::Query(_) => {
+                                return self
+                                    .send_query_error(
+                                        client,
+                                        "COPY (query) FROM STDIN is not supported".to_string(),
+                                    )
+                                    .await;
+                            }
+                        };
 
-                    let table_read = table.read().unwrap();
-                    let visible_columns = table_read.get_visible_column_map(transaction)?;
-                    let filter = if let Some(selection) = selection.as_ref() {
-                        Some(SearchRequest::parse_sql_expression(selection)?)
-                    } else {
-                        None
-                    };
+                        let (transaction, auto_commit) = match self.begin_copy_transaction(client) {
+                            Ok(value) => value,
+                            Err(err) => return self.send_query_error(client, err.to_string()).await,
+                        };
 
-                    let search_request = SearchRequest {
-                        table_name: table_name.clone(),
-                        projection: None,
-                        filter,
-                        order_by: Vec::new(),
-                        limit: None,
-                        offset: None,
-                    };
-
-                    let rows = table_read.search(&search_request, transaction)?;
-
-                    let mut updated_count = 0;
-                    for row in rows {
-                        let mut row_data_by_id = AHashMap::new();
-                        for (column_name, value) in row.values {
-                            let column_id = visible_columns
-                                .get(&column_name)
-                                .ok_or_else(|| {
-                                    DataBaseErrors::QueryError(format!(
-                                        "Column '{}' not found during update", column_name,
-                                    ))
-                                })?;
-                            row_data_by_id.insert(*column_id, value);
-                        }
-
-                        for assignment in assignments.iter() {
-                            let column_name = match &assignment.target {
-                                sqlparser::ast::AssignmentTarget::ColumnName(name) => match name.0.last() {
-                                    Some(ident) => normalize_identifier(&ident.value),
-                                    None => {
-                                        return Err(DataBaseErrors::QueryError(
-                                            "Invalid assignment target".into(),
-                                        ));
+                        let columns_result: Result<Vec<CopyColumnSpec>, String> = {
+                            let db_read = self.db.read().unwrap();
+                            match db_read.get_table(table_name.clone()) {
+                                None => Err(format!("Table '{table_name}' not found")),
+                                Some(table_ref) => match table_ref.read() {
+                                    Ok(table) => resolve_copy_columns(
+                                        &table,
+                                        &transaction,
+                                        requested_columns,
+                                        normalize_identifier,
+                                    )
+                                    .map_err(|err| err.to_string()),
+                                    Err(_) => {
+                                        Err("Failed to acquire table read lock".to_string())
                                     }
                                 },
-                                _ => {
-                                    return Err(DataBaseErrors::QueryError(
-                                        "Only single-column UPDATE assignments are supported".into(),
-                                    ));
-                                }
-                            };
+                            }
+                        };
+                        let columns = match columns_result {
+                            Ok(columns) => columns,
+                            Err(message) => return self.send_query_error(client, message).await,
+                        };
+                        let column_count = columns.len();
 
-                            let column_id = visible_columns.get(&column_name).ok_or_else(|| {
-                                DataBaseErrors::QueryError(format!(
-                                    "Assignment column '{}' not found", column_name,
-                                ))
+                        self.copy_sessions.write().unwrap().insert(
+                            client.socket_addr(),
+                            CopySession {
+                                table_name,
+                                columns,
+                                options: copy_options,
+                                buffer: Vec::new(),
+                                transaction,
+                                auto_commit,
+                            },
+                        );
+
+                        return Ok(vec![Response::CopyIn(CopyResponse::new(
+                            0,
+                            column_count,
+                            vec![0; column_count],
+                        ))]);
+                    }
+                    (true, CopyTarget::Stdout) => {
+                        let (table_name, requested_columns) = match &source {
+                            CopySource::Table { table_name, columns } => {
+                                match parse_table_name(table_name) {
+                                    Ok(name) => (name, columns.as_slice()),
+                                    Err(err) => {
+                                        return self.send_query_error(client, err.to_string()).await;
+                                    }
+                                }
+                            }
+                            CopySource::Query(_) => {
+                                return self
+                                    .send_query_error(
+                                        client,
+                                        "COPY (query) TO STDOUT is not supported".to_string(),
+                                    )
+                                    .await;
+                            }
+                        };
+
+                        let result = self.execute_transactional(client, |transaction| {
+                            let db_read = self.db.read().unwrap();
+                            let table_ref = db_read
+                                .get_table(table_name.clone())
+                                .ok_or_else(|| DataBaseErrors::TableNotFound(table_name.clone()))?;
+                            let table = table_ref.read().map_err(|_| {
+                                DataBaseErrors::QueryError(
+                                    "Failed to acquire table read lock".into(),
+                                )
                             })?;
 
-                            let value = parse_sql_literal(&assignment.value)?;
-                            row_data_by_id.insert(*column_id, value);
+                            let columns =
+                                resolve_copy_columns(&table, transaction, requested_columns, normalize_identifier)?;
+                            let rows = table.collect_visible_rows(transaction)?;
+                            let payload = encode_copy_payload(&rows, &columns, &copy_options)?;
+                            Ok((rows.len(), payload, columns.len()))
+                        });
+
+                        match result {
+                            Ok((row_count, payload, column_count)) => {
+                                send_copy_out_response(
+                                    client,
+                                    CopyResponse::new(0, column_count, vec![0; column_count]),
+                                )
+                                .await?;
+                                if !payload.is_empty() {
+                                    client
+                                        .send(PgWireBackendMessage::CopyData(CopyData::new(
+                                            Bytes::from(payload),
+                                        )))
+                                        .await?;
+                                }
+                                client
+                                    .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                                    .await?;
+                                return Ok(vec![Response::Execution(
+                                    Tag::new("COPY").with_rows(row_count),
+                                )]);
+                            }
+                            Err(DataBaseErrors::TableNotFound(name)) => {
+                                return self
+                                    .send_query_error(
+                                        client,
+                                        format!("Table '{name}' not found"),
+                                    )
+                                    .await;
+                            }
+                            Err(err) => {
+                                return self.send_query_error(client, err.to_string()).await;
+                            }
                         }
-
-                        table_read.update_row(row.row_id, row_data_by_id, transaction)?;
-                        updated_count += 1;
                     }
-
-                    Ok(updated_count)
-                });
-
-                match result {
-                    Ok(_) => return Ok(vec![Response::Execution(Tag::new("UPDATE"))]),
-                    Err(DataBaseErrors::TableNotFound(name)) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42P01".to_owned(),
-                                    format!("Table '{}' not found", name),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    (false, CopyTarget::File { .. } | CopyTarget::Program { .. }) => {
+                        return self
+                            .send_query_error(
+                                client,
+                                "COPY FROM file/program is not supported; use STDIN".to_string(),
+                            )
+                            .await;
                     }
-                    Err(err) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new(
-                                    "ERROR".to_owned(),
-                                    "42601".to_owned(),
-                                    format!("{}", err),
-                                ),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+                    (true, CopyTarget::File { .. } | CopyTarget::Program { .. }) => {
+                        return self
+                            .send_query_error(
+                                client,
+                                "COPY TO file/program is not supported; use STDOUT".to_string(),
+                            )
+                            .await;
+                    }
+                    _ => {
+                        return self
+                            .send_query_error(client, "Unsupported COPY target".to_string())
+                            .await;
                     }
                 }
             }
-            Statement::Query(_) => {
-                let search_request = match SearchRequest::from_sql(query) {
-                    Ok(request) => request,
-                    Err(err) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), err.to_string()),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+            Statement::Query(query) => {
+                let (column_names, search_results) = match self
+                    .run_query_pipeline(client, Statement::Query(query))
+                {
+                    Ok(ExecutionResult::Select { column_names, rows }) => (column_names, rows),
+                    Ok(_) => {
+                        return self
+                            .send_query_error(client, "Unexpected SELECT pipeline result".to_string())
+                            .await;
                     }
-                };
-
-                let outcome = self.execute_transactional(client, |transaction| {
-                    let table_ref = {
-                        let db_read = self.db.read().unwrap();
-                        db_read.get_table(search_request.table_name.clone())
-                    };
-
-                    let table = match table_ref {
-                        Some(table) => table,
-                        None => return Err(DataBaseErrors::TableNotFound(search_request.table_name.clone())),
-                    };
-
-                    let search_results = {
-                        let table_read = table.read().unwrap();
-                        table_read.search(&search_request, transaction)
-                    };
-
-                    let search_results = search_results?;
-
-                    let column_names = if let Some(projection) = &search_request.projection {
-                        projection.clone()
-                    } else {
-                        let table_read = table.read().unwrap();
-                        table_read.get_visible_column_names(transaction)
-                    };
-
-                    Ok((column_names, search_results))
-                });
-
-                let (column_names, search_results) = match outcome {
-                    Ok((columns, rows)) => (columns, rows),
-                    Err(DataBaseErrors::TableNotFound(table_name)) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new("ERROR".to_owned(), "42P01".to_owned(), format!("Table '{}' not found", table_name)),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
-                    Err(err) => {
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                                ErrorInfo::new("ERROR".to_owned(), "42601".to_owned(), err.to_string()),
-                            )))
-                            .await?;
-                        return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-                    }
+                    Err(err) => return self.respond_planned_error(client, err).await,
                 };
 
                 let schema: Arc<Vec<FieldInfo>> = Arc::new(
@@ -1346,6 +1521,104 @@ impl SimpleQueryHandler for PgWireHandler {
     }
 }
 
+#[async_trait]
+impl CopyHandler for PgWireHandler {
+    async fn on_copy_data<C>(&self, client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let mut sessions = self.copy_sessions.write().unwrap();
+        let session = sessions.get_mut(&client.socket_addr()).ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "57014".to_owned(),
+                "No active COPY session".to_owned(),
+            )))
+        })?;
+        append_copy_data(&mut session.buffer, &copy_data.data);
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let session = self
+            .copy_sessions
+            .write()
+            .unwrap()
+            .remove(&client.socket_addr())
+            .ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "57014".to_owned(),
+                    "No active COPY session".to_owned(),
+                )))
+            })?;
+
+        let result = (|| -> Result<usize, DataBaseErrors> {
+            let rows = parse_copy_rows(&session.buffer, &session.columns, &session.options)?;
+            let db_read = self.db.read().unwrap();
+            let table_ref = db_read
+                .get_table(session.table_name.clone())
+                .ok_or_else(|| DataBaseErrors::TableNotFound(session.table_name.clone()))?;
+            let table = table_ref
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
+
+            for row_data in &rows {
+                table.insert_row(row_data.clone(), &session.transaction, |table_id, column_id, value| {
+                    let db = self.db.read().unwrap();
+                    db.foreign_key_value_exists(table_id, column_id, value, &session.transaction)
+                })?;
+            }
+
+            Ok(rows.len())
+        })();
+
+        match result {
+            Ok(row_count) => {
+                self.finish_copy_transaction(&session.transaction, session.auto_commit, true);
+                client
+                    .send(PgWireBackendMessage::CommandComplete(CommandComplete::from(
+                        Tag::new("COPY").with_rows(row_count),
+                    )))
+                    .await?;
+                Ok(())
+            }
+            Err(err) => {
+                self.finish_copy_transaction(&session.transaction, session.auto_commit, false);
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    err.to_string(),
+                ))))
+            }
+        }
+    }
+
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let Some(session) = self.copy_sessions.write().unwrap().remove(&client.socket_addr()) {
+            self.finish_copy_transaction(&session.transaction, session.auto_commit, false);
+        }
+
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "57014".to_owned(),
+            format!("COPY FROM STDIN terminated: {}", fail.message),
+        )))
+    }
+}
+
 struct PgWireHandlerFactoryImpl {
     handler: Arc<PgWireHandler>,
 }
@@ -1354,7 +1627,7 @@ impl PgWireHandlerFactory for PgWireHandlerFactoryImpl {
     type StartupHandler = PgWireHandler;
     type SimpleQueryHandler = PgWireHandler;
     type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
-    type CopyHandler = NoopCopyHandler;
+    type CopyHandler = PgWireHandler;
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
         self.handler.clone()
@@ -1369,7 +1642,7 @@ impl PgWireHandlerFactory for PgWireHandlerFactoryImpl {
     }
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
-        Arc::new(NoopCopyHandler)
+        self.handler.clone()
     }
 }
 
@@ -1378,7 +1651,11 @@ pub async fn run_pgwire_server(db: Arc<RwLock<Database>>, addr: &str) {
     println!("pgwire listening on {}", addr);
 
     let factory = Arc::new(PgWireHandlerFactoryImpl {
-        handler: Arc::new(PgWireHandler { db, active_transactions: Arc::new(RwLock::new(HashMap::new())) }),
+        handler: Arc::new(PgWireHandler {
+            db,
+            active_transactions: Arc::new(RwLock::new(HashMap::new())),
+            copy_sessions: Arc::new(RwLock::new(HashMap::new())),
+        }),
     });
 
     loop {

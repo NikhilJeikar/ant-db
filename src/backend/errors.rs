@@ -17,6 +17,10 @@ pub enum DataBaseErrors {
     NullValue(),
     #[error("Unique Constraint failed for {0}")]
     UniqueConstraint(String),
+    #[error("Foreign key constraint violated on column '{0}'")]
+    ForeignKeyViolation(String),
+    #[error("CHECK constraint on column '{0}' is not enforced")]
+    CheckConstraintUnsupported(String),
     
 
 
@@ -41,12 +45,6 @@ pub enum DataBaseErrors {
     SerializationError(String),
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
-
-    // WAL-related errors
-    #[error("WAL lock error.")]
-    WalLockError,
-    #[error("WAL replay error: {0}")]
-    WalReplayError(String),
 
     // Query errors
     #[error("Query error: {0}")]

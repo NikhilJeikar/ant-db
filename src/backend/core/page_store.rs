@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::core::row::RowID;
 use crate::backend::core::table::{Page, PageID};
 use crate::backend::errors::DataBaseErrors;
 
@@ -22,6 +23,15 @@ struct PageLocation {
 }
 
 type PageIndex = BTreeMap<PageID, PageLocation>;
+type RowLocationIndex = BTreeMap<RowID, PageID>;
+
+/// On-disk page index plus a row -> page map for fast startup without loading pages.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DiskIndex {
+    pages: PageIndex,
+    #[serde(default)]
+    row_locations: RowLocationIndex,
+}
 
 /// On-disk header for a page-addressable table file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +98,7 @@ impl PageFileHeader {
 #[derive(Debug, Default)]
 struct PageStoreState {
     index: PageIndex,
+    row_locations: RowLocationIndex,
     index_offset: u64,
     index_length: u64,
     append_offset: u64,
@@ -134,15 +145,24 @@ impl PageStore {
         options
     }
 
-    fn serialize_index(index: &PageIndex) -> Result<Vec<u8>, DataBaseErrors> {
-        bincode::serialize(index).map_err(|e| DataBaseErrors::SerializationError(e.to_string()))
+    fn serialize_index(index: &PageIndex, row_locations: &RowLocationIndex) -> Result<Vec<u8>, DataBaseErrors> {
+        let disk = DiskIndex {
+            pages: index.clone(),
+            row_locations: row_locations.clone(),
+        };
+        bincode::serialize(&disk).map_err(|e| DataBaseErrors::SerializationError(e.to_string()))
     }
 
-    fn deserialize_index(bytes: &[u8]) -> Result<PageIndex, DataBaseErrors> {
+    fn deserialize_index(bytes: &[u8]) -> Result<(PageIndex, RowLocationIndex), DataBaseErrors> {
         if bytes.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), BTreeMap::new()));
         }
-        bincode::deserialize(bytes).map_err(|e| DataBaseErrors::DeserializationError(e.to_string()))
+        if let Ok(disk) = bincode::deserialize::<DiskIndex>(bytes) {
+            return Ok((disk.pages, disk.row_locations));
+        }
+        let pages: PageIndex = bincode::deserialize(bytes)
+            .map_err(|e| DataBaseErrors::DeserializationError(e.to_string()))?;
+        Ok((pages, BTreeMap::new()))
     }
 
     fn read_index_bytes(
@@ -160,7 +180,7 @@ impl PageStore {
         Ok(bytes)
     }
 
-    fn read_header_and_index(path: &Path) -> Result<Option<(PageFileHeader, PageIndex)>, DataBaseErrors> {
+    fn read_header_and_index(path: &Path) -> Result<Option<(PageFileHeader, PageIndex, RowLocationIndex)>, DataBaseErrors> {
         if !path.exists() {
             return Ok(None);
         }
@@ -169,12 +189,18 @@ impl PageStore {
             return Ok(None);
         };
         let index_bytes = Self::read_index_bytes(&mut file, &header)?;
-        let index = Self::deserialize_index(&index_bytes)?;
-        Ok(Some((header, index)))
+        let (index, row_locations) = Self::deserialize_index(&index_bytes)?;
+        Ok(Some((header, index, row_locations)))
     }
 
-    fn populate_state(state: &mut PageStoreState, header: PageFileHeader, index: PageIndex) {
+    fn populate_state(
+        state: &mut PageStoreState,
+        header: PageFileHeader,
+        index: PageIndex,
+        row_locations: RowLocationIndex,
+    ) {
         state.index = index;
+        state.row_locations = row_locations;
         state.index_offset = header.index_offset;
         state.index_length = header.index_length;
         state.append_offset = header.append_offset;
@@ -203,13 +229,13 @@ impl PageStore {
             return Ok(());
         }
 
-        let Some((header, index)) = Self::read_header_and_index(&self.path)? else {
+        let Some((header, index, row_locations)) = Self::read_header_and_index(&self.path)? else {
             return Err(DataBaseErrors::DeserializationError(format!(
                 "Invalid page file '{}': missing or corrupt ANTPG header",
                 self.path.display()
             )));
         };
-        Self::populate_state(state, header, index);
+        Self::populate_state(state, header, index, row_locations);
         Ok(())
     }
 
@@ -237,10 +263,14 @@ impl PageStore {
         Ok(bytes)
     }
 
-    fn write_compact_file(
+    fn write_compact_file<'a, I>(
         path: &Path,
-        pages: &BTreeMap<PageID, Page>,
-    ) -> Result<(PageFileHeader, PageIndex), DataBaseErrors> {
+        pages: I,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(PageFileHeader, PageIndex, RowLocationIndex), DataBaseErrors>
+    where
+        I: Iterator<Item = (PageID, &'a Page)>,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
         }
@@ -267,7 +297,7 @@ impl PageStore {
             file.write_all(&page_bytes)
                 .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
             index.insert(
-                *page_id,
+                page_id,
                 PageLocation {
                     offset,
                     length: page_bytes.len() as u32,
@@ -276,7 +306,7 @@ impl PageStore {
             offset += page_bytes.len() as u64;
         }
 
-        let index_bytes = Self::serialize_index(&index)?;
+        let index_bytes = Self::serialize_index(&index, row_locations)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
         file.write_all(&index_bytes)
@@ -291,7 +321,63 @@ impl PageStore {
         file.sync_all()
             .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
         fs::rename(&tmp_path, path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
-        Ok((header, index))
+        Ok((header, index, row_locations.clone()))
+    }
+
+    fn write_compact_file_from_bytes(
+        path: &Path,
+        pages: impl IntoIterator<Item = (PageID, Vec<u8>)>,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(PageFileHeader, PageIndex, RowLocationIndex), DataBaseErrors> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        }
+
+        let tmp_path = path.with_extension("tmp");
+        let mut file = Self::open_file(true, true)
+            .open(&tmp_path)
+            .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+
+        PageFileHeader {
+            index_offset: HEADER_SIZE,
+            index_length: 0,
+            append_offset: HEADER_SIZE,
+        }
+        .write_to(&mut file)?;
+
+        let mut index = PageIndex::new();
+        let mut offset = HEADER_SIZE;
+        for (page_id, page_bytes) in pages {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+            file.write_all(&page_bytes)
+                .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+            index.insert(
+                page_id,
+                PageLocation {
+                    offset,
+                    length: page_bytes.len() as u32,
+                },
+            );
+            offset += page_bytes.len() as u64;
+        }
+
+        let index_bytes = Self::serialize_index(&index, row_locations)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        file.write_all(&index_bytes)
+            .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+
+        let header = PageFileHeader {
+            index_offset: offset,
+            index_length: index_bytes.len() as u64,
+            append_offset: offset + index_bytes.len() as u64,
+        };
+        header.write_to(&mut file)?;
+        file.sync_all()
+            .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        fs::rename(&tmp_path, path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        Ok((header, index, row_locations.clone()))
     }
 
     /// Return all page IDs known to exist on disk (index only, no page I/O).
@@ -310,16 +396,63 @@ impl PageStore {
         Ok(pages)
     }
 
-    pub fn write_all(&self, pages: &BTreeMap<PageID, Page>) -> Result<(), DataBaseErrors> {
-        let (header, index) = Self::write_compact_file(&self.path, pages)?;
+    pub fn write_all(
+        &self,
+        pages: &BTreeMap<PageID, Page>,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(), DataBaseErrors> {
+        let (header, index, row_locations) =
+            Self::write_compact_file_owned(&self.path, pages, row_locations)?;
         self.with_state(|state| {
-            Self::populate_state(state, header, index);
+            Self::populate_state(state, header, index, row_locations);
             Ok(())
         })
     }
 
+    fn write_compact_file_owned(
+        path: &Path,
+        pages: &BTreeMap<PageID, Page>,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(PageFileHeader, PageIndex, RowLocationIndex), DataBaseErrors> {
+        Self::write_compact_file(path, pages.iter().map(|(id, page)| (*id, page)), row_locations)
+    }
+
+    pub fn write_all_serialized(
+        &self,
+        pages: impl IntoIterator<Item = (PageID, Vec<u8>)>,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(), DataBaseErrors> {
+        let (header, index, row_locations) =
+            Self::write_compact_file_from_bytes(&self.path, pages, row_locations)?;
+        self.with_state(|state| {
+            Self::populate_state(state, header, index, row_locations);
+            Ok(())
+        })
+    }
+
+    /// Append a single page to the on-disk file without cloning the in-memory page.
+    pub fn merge_page(
+        &self,
+        page_id: PageID,
+        page: &Page,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(), DataBaseErrors> {
+        let mut updates = BTreeMap::new();
+        updates.insert(page_id, page);
+        self.merge_pages(&updates, row_locations)
+    }
+
+    /// Return the persisted row -> page map (empty for legacy page files).
+    pub fn read_row_locations(&self) -> Result<RowLocationIndex, DataBaseErrors> {
+        self.with_state(|state| Ok(state.row_locations.clone()))
+    }
+
     /// Merge one or more pages into the on-disk file using append-only writes.
-    pub fn merge_pages(&self, updates: &BTreeMap<PageID, Page>) -> Result<(), DataBaseErrors> {
+    pub fn merge_pages(
+        &self,
+        updates: &BTreeMap<PageID, &Page>,
+        row_locations: &RowLocationIndex,
+    ) -> Result<(), DataBaseErrors> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -352,7 +485,8 @@ impl PageStore {
                 append_offset += page_bytes.len() as u64;
             }
 
-            let index_bytes = Self::serialize_index(&state.index)?;
+            state.row_locations = row_locations.clone();
+            let index_bytes = Self::serialize_index(&state.index, &state.row_locations)?;
             file.seek(SeekFrom::Start(append_offset))
                 .map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
             file.write_all(&index_bytes)
@@ -413,7 +547,7 @@ mod tests {
         for page_id in 1..=20 {
             pages.insert(page_id, sample_page(page_id));
         }
-        store.write_all(&pages).unwrap();
+        store.write_all(&pages, &BTreeMap::new()).unwrap();
 
         let file_len = fs::metadata(&path).unwrap().len();
         assert!(file_len > 1024, "expected non-trivial page file");
@@ -430,16 +564,32 @@ mod tests {
     #[test]
     fn merge_pages_appends_without_rewriting_existing_records() {
         let (store, path) = temp_page_store("merge");
-        let mut first = BTreeMap::new();
-        first.insert(1, sample_page(1));
-        store.merge_pages(&first).unwrap();
+        let first = sample_page(1);
+        store.merge_page(1, &first, &BTreeMap::new()).unwrap();
 
-        let mut second = BTreeMap::new();
-        second.insert(2, sample_page(2));
-        store.merge_pages(&second).unwrap();
+        let second = sample_page(2);
+        store.merge_page(2, &second, &BTreeMap::new()).unwrap();
 
         assert_eq!(store.read_page(1).unwrap().unwrap().id(), 1);
         assert_eq!(store.read_page(2).unwrap().unwrap().id(), 2);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn row_locations_persist_without_page_reads() {
+        let (store, path) = temp_page_store("row-locations");
+        let mut pages = BTreeMap::new();
+        pages.insert(1, sample_page(1));
+
+        let mut row_locations = BTreeMap::new();
+        row_locations.insert(10, 1);
+        row_locations.insert(11, 1);
+        store.write_all(&pages, &row_locations).unwrap();
+
+        let loaded = store.read_row_locations().unwrap();
+        assert_eq!(loaded.get(&10), Some(&1));
+        assert_eq!(loaded.get(&11), Some(&1));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

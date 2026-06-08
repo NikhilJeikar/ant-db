@@ -10,8 +10,11 @@ use crate::backend::config::{Config, InternalStateManager};
 use crate::backend::core::column::Constraint;
 use crate::backend::core::column::{Column, ColumnID, DataBaseDataType};
 use crate::backend::core::page_store::PageStore;
-use crate::backend::core::row::{DataBaseDataEntry, Row, RowID};
-use crate::backend::core::search::{OrderBy, SearchRequest, SearchResult, SortBy};
+use crate::backend::core::row::{DataBaseDataEntry, Row, RowData, RowID};
+use crate::backend::core::plan::physical::AccessPath;
+use crate::backend::core::search::{
+    OrderBy, RowEvaluationContext, SearchRequest, SearchResult, SortBy,
+};
 use crate::backend::core::transaction::{Transaction, TransactionID};
 use crate::backend::errors::DataBaseErrors;
 
@@ -31,20 +34,23 @@ fn serialize_columns<S>(
 where
     S: Serializer,
 {
-    let export: BTreeMap<ColumnID, Column> = columns
-        .iter()
-        .filter_map(|(k, v)| match v.read() {
-            Ok(guard) => Some((*k, guard.clone())),
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(columns.len()))?;
+    for (column_id, column) in columns.iter() {
+        match column.read() {
+            Ok(guard) => {
+                map.serialize_entry(column_id, &*guard)?;
+            }
             Err(e) => {
                 error!(
                     "Failed to acquire read lock on column {} during serialization: {}",
-                    k, e
+                    column_id, e
                 );
-                None
             }
-        })
-        .collect();
-    export.serialize(serializer)
+        }
+    }
+    map.end()
 }
 
 fn deserialize_columns<'de, D>(
@@ -61,29 +67,14 @@ where
 }
 
 fn serialize_row_space<S>(
-    row_space: &RwLock<BTreeMap<PageID, Arc<RwLock<Page>>>>,
+    _row_space: &RwLock<BTreeMap<PageID, Arc<RwLock<Page>>>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let guard = row_space
-        .read()
-        .map_err(|_| serde::ser::Error::custom("Failed to acquire row_space read lock"))?;
-    let export: BTreeMap<PageID, Page> = guard
-        .iter()
-        .filter_map(|(k, v)| match v.read() {
-            Ok(guard) => Some((*k, guard.clone())),
-            Err(e) => {
-                error!(
-                    "Failed to acquire read lock on page {} during serialization: {}",
-                    k, e
-                );
-                None
-            }
-        })
-        .collect();
-    export.serialize(serializer)
+    // Page data is flushed to the table page file before snapshot save.
+    BTreeMap::<PageID, Page>::new().serialize(serializer)
 }
 
 fn deserialize_row_space<'de, D>(
@@ -102,16 +93,14 @@ where
 }
 
 fn serialize_row_locations<S>(
-    row_locations: &RwLock<BTreeMap<RowID, PageID>>,
+    _row_locations: &RwLock<BTreeMap<RowID, PageID>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let guard = row_locations
-        .read()
-        .map_err(|_| serde::ser::Error::custom("Failed to acquire row_locations read lock"))?;
-    guard.serialize(serializer)
+    // Rebuilt from the table page file on load.
+    BTreeMap::<RowID, PageID>::new().serialize(serializer)
 }
 
 fn deserialize_row_locations<'de, D>(
@@ -170,6 +159,11 @@ impl Page {
         Self::new(page_id, capacity)
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_rows(&self) -> bool {
+        !self.rows.is_empty()
+    }
+
     /// Whether a row of `size` bytes can still be appended to this page.
     fn has_room_for(&self, size: u64) -> bool {
         !self.is_overflow && self.used_bytes.saturating_add(size) <= self.capacity
@@ -206,6 +200,10 @@ pub struct Table {
         deserialize_with = "deserialize_columns"
     )]
     columns: BTreeMap<ColumnID, Arc<RwLock<Column>>>,
+
+    /// Maps user-created index names (normalized) to the indexed column.
+    #[serde(default)]
+    index_names: BTreeMap<String, ColumnID>,
 
     next_page_id: AtomicU64,
     next_row_id: AtomicU64,
@@ -270,6 +268,7 @@ impl Clone for Table {
             row_space: RwLock::new(row_space),
             row_locations: RwLock::new(row_locations),
             columns: self.columns.clone(),
+            index_names: self.index_names.clone(),
             next_page_id: AtomicU64::new(self.next_page_id.load(Ordering::SeqCst)),
             next_row_id: AtomicU64::new(self.next_row_id.load(Ordering::SeqCst)),
             next_column_id: AtomicU16::new(self.next_column_id.load(Ordering::SeqCst)),
@@ -305,15 +304,27 @@ impl Table {
         }
     }
 
-    pub fn bind_page_store(&mut self, database_name: &str) {
+    #[cfg(test)]
+    pub fn row_location_count(&self) -> usize {
+        self.row_locations
+            .read()
+            .map(|locations| locations.len())
+            .unwrap_or(0)
+    }
+
+    pub fn bind_page_store(
+        &mut self,
+        database_name: &str,
+        internal_state_manager: Arc<RwLock<InternalStateManager>>,
+    ) {
+        self.internal_state_manager = internal_state_manager;
         if self.database_name.is_empty() {
             self.database_name = database_name.to_string();
         }
         self.refresh_page_store();
-        self.rebuild_runtime_state();
-        if let Err(err) = self.sync_on_disk_pages_from_store() {
+        if let Err(err) = self.restore_page_index_from_disk() {
             error!(
-                "Failed to sync on-disk page index for table '{}': {err}",
+                "Failed to restore page index for table '{}': {err}",
                 self.name
             );
         }
@@ -324,6 +335,40 @@ impl Table {
         if let Ok(mut on_disk) = self.on_disk_pages.write() {
             *on_disk = page_ids.into_iter().collect();
         }
+        Ok(())
+    }
+
+    /// Reconcile in-memory page state with the on-disk table page file.
+    ///
+    /// When a page file exists it is treated as the source of truth: row locations
+    /// are rebuilt by scanning every page on disk and in-memory pages are cleared
+    /// so they are loaded on demand. Legacy snapshots that still embed row data
+    /// keep their deserialized in-memory state when no page file is present.
+    fn restore_page_index_from_disk(&self) -> Result<(), DataBaseErrors> {
+        self.sync_on_disk_pages_from_store()?;
+        let page_ids = self.page_store.list_page_ids()?;
+        if page_ids.is_empty() {
+            self.rebuild_runtime_state();
+            return Ok(());
+        }
+
+        let mut row_locations = self.page_store.read_row_locations()?;
+        if row_locations.is_empty() {
+            for page_id in page_ids {
+                let page = self.load_page_from_disk(page_id)?;
+                for row_id in page.rows.keys() {
+                    row_locations.insert(*row_id, page_id);
+                }
+            }
+        }
+
+        if let Ok(mut guard) = self.row_locations.write() {
+            *guard = row_locations;
+        }
+        if let Ok(mut guard) = self.row_space.write() {
+            guard.clear();
+        }
+        self.rebuild_runtime_state();
         Ok(())
     }
 
@@ -407,19 +452,16 @@ impl Table {
         }
     }
 
-    fn write_pages_to_disk(&self, pages: &BTreeMap<PageID, Page>) -> Result<(), DataBaseErrors> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        self.page_store.merge_pages(pages)?;
-        self.mark_pages_on_disk(pages.keys().copied());
-        Ok(())
-    }
-
     fn write_page_to_disk(&self, page: &Page) -> Result<(), DataBaseErrors> {
-        let mut pages = BTreeMap::new();
-        pages.insert(page.id(), page.clone());
-        self.write_pages_to_disk(&pages)
+        let row_locations = self
+            .row_locations
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into()))?
+            .clone();
+        self.page_store
+            .merge_page(page.id(), page, &row_locations)?;
+        self.mark_pages_on_disk(std::iter::once(page.id()));
+        Ok(())
     }
 
     fn load_page_from_disk(&self, page_id: PageID) -> Result<Page, DataBaseErrors> {
@@ -531,44 +573,77 @@ impl Table {
     }
 
     pub fn persist_dirty_pages(&self) -> Result<(), DataBaseErrors> {
+        let row_locations = self
+            .row_locations
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into()))?
+            .clone();
         let row_space = self
             .row_space
             .read()
             .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space read lock".into()))?;
-        let mut updates = BTreeMap::new();
+        let mut flushed = Vec::new();
         for page_arc in row_space.values() {
             let page = page_arc
                 .read()
                 .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page read lock".into()))?;
             if page.is_dirty {
-                updates.insert(page.id(), page.clone());
+                self.page_store
+                    .merge_page(page.id(), &page, &row_locations)?;
+                flushed.push(page.id());
             }
         }
-        self.write_pages_to_disk(&updates)
+        self.mark_pages_on_disk(flushed);
+        Ok(())
     }
 
     pub fn flush_all_pages(&self) -> Result<(), DataBaseErrors> {
-        let page_ids: BTreeSet<PageID> = self
+        let row_locations = self
             .row_locations
             .read()
-            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into()))?
-            .values()
-            .copied()
-            .collect();
+            .map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into())
+            })?
+            .clone();
 
-        let mut pages_on_disk = BTreeMap::new();
-        for page_id in page_ids {
-            let page_arc = self.ensure_page_resident(page_id)?;
+        let row_space = self
+            .row_space
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space read lock".into()))?;
+
+        let in_memory: BTreeSet<PageID> = row_space.keys().copied().collect();
+        let mut pages: Vec<(PageID, Vec<u8>)> = Vec::new();
+
+        for page_id in self.page_store.list_page_ids()? {
+            if in_memory.contains(&page_id) {
+                continue;
+            }
+            if let Some(page) = self.page_store.read_page(page_id)? {
+                pages.push((
+                    page_id,
+                    bincode::serialize(&page)
+                        .map_err(|e| DataBaseErrors::SerializationError(e.to_string()))?,
+                ));
+            }
+        }
+
+        for (page_id, page_arc) in row_space.iter() {
             let mut page = page_arc
                 .write()
                 .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page write lock".into()))?;
             page.is_dirty = false;
-            pages_on_disk.insert(page_id, page.clone());
+            pages.push((
+                *page_id,
+                bincode::serialize(&*page)
+                    .map_err(|e| DataBaseErrors::SerializationError(e.to_string()))?,
+            ));
         }
 
-        self.page_store.write_all(&pages_on_disk)?;
+        pages.sort_by_key(|(page_id, _)| *page_id);
+        self.page_store
+            .write_all_serialized(pages.iter().cloned(), &row_locations)?;
         if let Ok(mut on_disk) = self.on_disk_pages.write() {
-            *on_disk = pages_on_disk.keys().copied().collect();
+            *on_disk = pages.into_iter().map(|(page_id, _)| page_id).collect();
         }
         Ok(())
     }
@@ -599,6 +674,7 @@ impl Table {
             database_name,
             name,
             columns: BTreeMap::new(),
+            index_names: BTreeMap::new(),
             row_space: RwLock::new(BTreeMap::new()),
             row_locations: RwLock::new(BTreeMap::new()),
             next_page_id: AtomicU64::new(0),
@@ -622,16 +698,15 @@ impl Table {
         database_name: &str,
         internal_state_manager: Arc<RwLock<InternalStateManager>>,
     ) {
-        self.internal_state_manager = internal_state_manager;
-        if self.database_name.is_empty() {
-            self.database_name = database_name.to_string();
-        }
-        self.refresh_page_store();
-        self.rebuild_runtime_state();
+        self.bind_page_store(database_name, internal_state_manager);
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn table_id(&self) -> TableID {
+        self.table_id
     }
 
     fn validate_data_type(
@@ -689,18 +764,146 @@ impl Table {
         Ok(())
     }
 
-    fn collect_all_rows(&self) -> HashMap<RowID, Row> {
-        let mut rows = HashMap::new();
-        if let Ok(row_space) = self.row_space.read() {
-            for page in row_space.values() {
-                if let Ok(page) = page.read() {
-                    for (row_id, row) in &page.rows {
-                        rows.insert(*row_id, row.clone());
-                    }
+    fn with_row<F, R>(&self, row_id: RowID, f: F) -> Result<R, DataBaseErrors>
+    where
+        F: FnOnce(Option<&Row>) -> R,
+    {
+        let page = self.page_for_row(row_id)?;
+        let page_guard = page.read().map_err(|_| {
+            DataBaseErrors::QueryError("Failed to acquire page read lock".into())
+        })?;
+        Ok(f(page_guard.rows.get(&row_id)))
+    }
+
+    fn row_id_iter(&self) -> Result<Vec<RowID>, DataBaseErrors> {
+        Ok(self
+            .row_locations
+            .read()
+            .map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into())
+            })?
+            .keys()
+            .copied()
+            .collect())
+    }
+
+    pub fn for_each_visible_row<F>(
+        &self,
+        transaction: &Transaction,
+        mut f: F,
+    ) -> Result<(), DataBaseErrors>
+    where
+        F: FnMut(RowID, RowData) -> Result<(), DataBaseErrors>,
+    {
+        let page_ids: BTreeSet<PageID> = self
+            .row_locations
+            .read()
+            .map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into())
+            })?
+            .values()
+            .copied()
+            .collect();
+
+        for page_id in page_ids {
+            let page = self.ensure_page_resident(page_id)?;
+            let page_guard = page.read().map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire page read lock".into())
+            })?;
+            for (row_id, row) in page_guard.rows.iter() {
+                if let Some(version) = row.get_versioned_row(transaction) {
+                    f(*row_id, version.data.clone())?;
                 }
             }
         }
-        rows
+        Ok(())
+    }
+
+    pub fn lookup_visible_row_data(
+        &self,
+        row_id: RowID,
+        transaction: &Transaction,
+    ) -> Result<Option<Arc<RowData>>, DataBaseErrors> {
+        let page = self.page_for_row(row_id)?;
+        let page_guard = page.read().map_err(|_| {
+            DataBaseErrors::QueryError("Failed to acquire page read lock".into())
+        })?;
+        Ok(page_guard
+            .rows
+            .get(&row_id)
+            .and_then(|row| row.get_versioned_row(transaction))
+            .map(|version| Arc::new(version.data.clone())))
+    }
+
+    fn row_is_alive_for_prune(
+        &self,
+        row_id: RowID,
+        oldest_active_txn: TransactionID,
+    ) -> bool {
+        self.with_row(row_id, |row| {
+            row.map(|row| {
+                row.get_raw_rows().iter().any(|version| {
+                    match version.transaction_header.deleted_by {
+                        None => true,
+                        Some(del) => del >= oldest_active_txn,
+                    }
+                })
+            })
+            .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    }
+
+    fn build_column_index_from_rows(
+        &self,
+        column_id: ColumnID,
+        transaction: &Transaction,
+    ) -> Result<usize, DataBaseErrors> {
+        {
+            let mut column = self.columns.get(&column_id).ok_or_else(|| {
+                DataBaseErrors::QueryError("Column not found while building index".into())
+            })?;
+            let mut column = column
+                .write()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column write lock".into()))?;
+            if !column.is_indexed(transaction) {
+                return Ok(0);
+            }
+            column.ensure_index_ready(transaction)?;
+        }
+
+        let mut indexed = 0usize;
+        for row_id in self.row_id_iter()? {
+            self.with_row(row_id, |row| -> Result<(), DataBaseErrors> {
+                if let Some(row) = row {
+                    let mut column = self.columns.get(&column_id).ok_or_else(|| {
+                        DataBaseErrors::QueryError("Column not found while building index".into())
+                    })?;
+                    let mut column = column.write().map_err(|_| {
+                        DataBaseErrors::QueryError("Failed to acquire column write lock".into())
+                    })?;
+                    if column.index_row(row_id, row, transaction) {
+                        indexed += 1;
+                    }
+                }
+                Ok(())
+            })??;
+        }
+        Ok(indexed)
+    }
+
+    fn materialize_all_pages(&self) -> Result<(), DataBaseErrors> {
+        let page_ids: BTreeSet<PageID> = self
+            .row_locations
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into()))?
+            .values()
+            .copied()
+            .collect();
+        for page_id in page_ids {
+            self.ensure_page_resident(page_id)?;
+        }
+        Ok(())
     }
 
     fn build_column_index_if_needed(
@@ -708,27 +911,20 @@ impl Table {
         column_id: ColumnID,
         transaction: &Transaction,
     ) -> Result<(), DataBaseErrors> {
-        let column = self.columns.get(&column_id).ok_or_else(|| {
-            DataBaseErrors::QueryError("Column not found while building index".into())
-        })?;
-        let mut column = column
-            .write()
-            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column write lock".into()))?;
-        if !column.is_indexed(transaction) {
-            return Ok(());
-        }
-        let rows = self.collect_all_rows();
-        column.create_index(&rows, transaction)?;
+        self.build_column_index_from_rows(column_id, transaction)?;
         Ok(())
     }
 
-    fn validate_row_data(
+    fn validate_row_data<G>(
         &self,
         data: &AHashMap<ColumnID, DataBaseDataEntry>,
         transaction: &Transaction,
         exclude_row_id: Option<RowID>,
-    ) -> Result<(), DataBaseErrors> {
-        let all_rows = self.collect_all_rows();
+        mut fk_lookup: G,
+    ) -> Result<(), DataBaseErrors>
+    where
+        G: FnMut(TableID, ColumnID, &DataBaseDataEntry) -> Result<bool, DataBaseErrors>,
+    {
         for (&column_id, column) in self.columns.iter() {
             let guard = column
                 .read()
@@ -736,9 +932,60 @@ impl Table {
             let value = data
                 .get(&column_id)
                 .unwrap_or(&DataBaseDataEntry::Null);
-            guard.schema_validation(value, &all_rows, transaction, exclude_row_id)?;
+            let Some(version) = guard.get_versioned_column(transaction) else {
+                continue;
+            };
+            if !Self::validate_data_type(value, &version.data_type, version.is_nullable()) {
+                return Err(DataBaseErrors::DataTypeMismatch(
+                    column_id as u64,
+                    version.data_type.name(),
+                    value.data_type().name(),
+                ));
+            }
+            guard.schema_validation(
+                value,
+                |row_id| {
+                    self.with_versioned_column_entry(row_id, column_id, transaction, |entry| {
+                        entry.cloned()
+                    })
+                },
+                &mut fk_lookup,
+                transaction,
+                exclude_row_id,
+            )?;
         }
         Ok(())
+    }
+
+    pub fn referenced_value_exists(
+        &self,
+        column_id: ColumnID,
+        value: &DataBaseDataEntry,
+        transaction: &Transaction,
+    ) -> Result<bool, DataBaseErrors> {
+        Ok(!self
+            .lookup_rows_by_column_value(column_id, value, transaction)?
+            .is_empty())
+    }
+
+    fn filter_visible_index_candidates(
+        &self,
+        row_ids: Vec<RowID>,
+        transaction: &Transaction,
+    ) -> Result<Vec<RowID>, DataBaseErrors> {
+        let mut visible = Vec::new();
+        for row_id in row_ids {
+            let page = self.page_for_row(row_id)?;
+            let page_guard = page.read().map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire page read lock".into())
+            })?;
+            if let Some(row) = page_guard.rows.get(&row_id) {
+                if row.get_versioned_row(transaction).is_some() {
+                    visible.push(row_id);
+                }
+            }
+        }
+        Ok(visible)
     }
 
     fn update_indexes_for_row(
@@ -761,23 +1008,70 @@ impl Table {
         Ok(())
     }
 
-    fn remove_indexes_for_row(
+    pub fn is_column_indexed(
         &self,
-        row_id: RowID,
-        data: &AHashMap<ColumnID, DataBaseDataEntry>,
+        column_name: &str,
+        transaction: &Transaction,
+    ) -> Result<bool, DataBaseErrors> {
+        let normalized = Self::normalize_column_name(column_name);
+        let column_map = self.get_visible_column_map(transaction)?;
+        let Some(column_id) = column_map.get(&normalized) else {
+            return Ok(false);
+        };
+        let column = self.columns.get(column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError("Column not found while checking index".into())
+        })?;
+        let column = column
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column read lock".into()))?;
+        Ok(column.is_indexed(transaction))
+    }
+
+    pub fn create_column_index(
+        &mut self,
+        index_name: Option<String>,
+        column_name: &str,
+        transaction: &Transaction,
+    ) -> Result<usize, DataBaseErrors> {
+        let normalized_column = Self::normalize_column_name(column_name);
+        let column_map = self.get_visible_column_map(transaction)?;
+        let column_id = *column_map.get(&normalized_column).ok_or_else(|| {
+            DataBaseErrors::QueryError(format!("Column '{normalized_column}' not found"))
+        })?;
+
+        let indexed = self.build_column_index_from_rows(column_id, transaction)?;
+
+        if let Some(name) = index_name {
+            self.index_names
+                .insert(Self::normalize_column_name(&name), column_id);
+        }
+
+        Ok(indexed)
+    }
+
+    pub fn drop_column_index(
+        &mut self,
+        index_name: &str,
         transaction: &Transaction,
     ) -> Result<(), DataBaseErrors> {
-        for (&column_id, column) in self.columns.iter() {
-            let mut guard = column.write().map_err(|_| {
-                DataBaseErrors::QueryError("Failed to acquire column write lock".into())
-            })?;
-            if !guard.is_indexed(transaction) {
-                continue;
-            }
-            if let Some(value) = data.get(&column_id) {
-                guard.remove_from_index(column_id, value, row_id, transaction);
-            }
-        }
+        let normalized = Self::normalize_column_name(index_name);
+        let column_id = if let Some(column_id) = self.index_names.get(&normalized).copied() {
+            column_id
+        } else {
+            let column_map = self.get_visible_column_map(transaction)?;
+            *column_map.get(&normalized).ok_or_else(|| {
+                DataBaseErrors::IndexNotFound(index_name.to_string())
+            })?
+        };
+
+        let column = self.columns.get(&column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError("Column not found while dropping index".into())
+        })?;
+        let mut column = column
+            .write()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column write lock".into()))?;
+        column.drop_index(transaction)?;
+        self.index_names.remove(&normalized);
         Ok(())
     }
 
@@ -786,11 +1080,12 @@ impl Table {
         column_id: ColumnID,
         transaction: &Transaction,
     ) -> Result<(), DataBaseErrors> {
-        self.columns
-            .get(&column_id)
-            .unwrap()
+        let column = self.columns.get(&column_id).ok_or(DataBaseErrors::ColumnNotFound(
+            column_id as u64,
+        ))?;
+        column
             .write()
-            .unwrap()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column write lock".into()))?
             .remove(transaction);
         Ok(())
     }
@@ -944,12 +1239,16 @@ impl Table {
         Ok(head_id)
     }
 
-    pub fn insert_row(
+    pub fn insert_row<G>(
         &self,
         data: AHashMap<ColumnID, DataBaseDataEntry>,
         transaction: &Transaction,
-    ) -> Result<RowID, DataBaseErrors> {
-        self.validate_row_data(&data, transaction, None)?;
+        fk_lookup: G,
+    ) -> Result<RowID, DataBaseErrors>
+    where
+        G: FnMut(TableID, ColumnID, &DataBaseDataEntry) -> Result<bool, DataBaseErrors>,
+    {
+        self.validate_row_data(&data, transaction, None, fk_lookup)?;
 
         let row_id = self.next_row_id.fetch_add(1, Ordering::SeqCst) + 1;
         let row = Row::new(transaction, data.clone());
@@ -982,6 +1281,28 @@ impl Table {
         self.ensure_page_resident(page_id)
     }
 
+    fn with_versioned_column_entry<F, R>(
+        &self,
+        row_id: RowID,
+        column_id: ColumnID,
+        transaction: &Transaction,
+        f: F,
+    ) -> Result<R, DataBaseErrors>
+    where
+        F: FnOnce(Option<&DataBaseDataEntry>) -> R,
+    {
+        let page = self.page_for_row(row_id)?;
+        let page_guard = page.read().map_err(|_| {
+            DataBaseErrors::QueryError("Failed to acquire page read lock".into())
+        })?;
+        let entry = page_guard
+            .rows
+            .get(&row_id)
+            .and_then(|row| row.get_versioned_row(transaction))
+            .and_then(|version| version.data.get(&column_id));
+        Ok(f(entry))
+    }
+
     pub fn delete_row(
         &self,
         row_id: RowID,
@@ -997,12 +1318,16 @@ impl Table {
         Ok(())
     }
 
-    pub fn update_row(
+    pub fn update_row<G>(
         &self,
         row_id: RowID,
         data: AHashMap<ColumnID, DataBaseDataEntry>,
         transaction: &Transaction,
-    ) -> Result<(), DataBaseErrors> {
+        fk_lookup: G,
+    ) -> Result<(), DataBaseErrors>
+    where
+        G: FnMut(TableID, ColumnID, &DataBaseDataEntry) -> Result<bool, DataBaseErrors>,
+    {
         let page = self.page_for_row(row_id)?;
         let mut page = page.write().unwrap();
         let row = page
@@ -1016,22 +1341,7 @@ impl Table {
             .unwrap_or_default();
         effective_data.extend(data.iter().map(|(&k, v)| (k, v.clone())));
 
-        self.validate_row_data(&effective_data, transaction, Some(row_id))?;
-
-        let old_values: AHashMap<ColumnID, DataBaseDataEntry> = row
-            .get_versioned_row(transaction)
-            .map(|version| {
-                data.keys()
-                    .filter_map(|column_id| {
-                        version
-                            .data
-                            .get(column_id)
-                            .map(|value| (*column_id, value.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.remove_indexes_for_row(row_id, &old_values, transaction)?;
+        self.validate_row_data(&effective_data, transaction, Some(row_id), fk_lookup)?;
 
         page.rows
             .get_mut(&row_id)
@@ -1059,6 +1369,55 @@ impl Table {
         name.to_ascii_lowercase()
     }
 
+    pub fn get_copy_column_specs(
+        &self,
+        transaction: &Transaction,
+        requested_columns: &[String],
+    ) -> Result<Vec<(String, ColumnID, DataBaseDataType)>, DataBaseErrors> {
+        let visible_map = self.get_visible_column_map(transaction)?;
+
+        let column_names: Vec<String> = if !requested_columns.is_empty() {
+            requested_columns.to_vec()
+        } else {
+            let mut columns: Vec<(ColumnID, String)> = self
+                .columns
+                .iter()
+                .filter_map(|(&column_id, column)| {
+                    column.read().ok().and_then(|guard| {
+                        guard
+                            .get_versioned_column(transaction)
+                            .map(|version| (column_id, version.name.to_ascii_lowercase()))
+                    })
+                })
+                .collect();
+            columns.sort_by_key(|(column_id, _)| *column_id);
+            columns.into_iter().map(|(_, name)| name).collect()
+        };
+
+        let mut specs = Vec::with_capacity(column_names.len());
+        for column_name in column_names {
+            let column_id = visible_map.get(&column_name).copied().ok_or_else(|| {
+                DataBaseErrors::QueryError(format!("Column '{column_name}' not found"))
+            })?;
+            let column = self.columns.get(&column_id).ok_or_else(|| {
+                DataBaseErrors::QueryError(format!("Column '{column_name}' not found"))
+            })?;
+            let guard = column
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column read lock".into()))?;
+            let version = guard.get_versioned_column(transaction).ok_or_else(|| {
+                DataBaseErrors::QueryError(format!("Column '{column_name}' not found"))
+            })?;
+            specs.push((
+                column_name,
+                column_id,
+                version.data_type.clone(),
+            ));
+        }
+
+        Ok(specs)
+    }
+
     pub fn get_visible_column_names(&self, transaction: &Transaction) -> Vec<String> {
         let mut names: Vec<String> = self
             .columns
@@ -1072,6 +1431,67 @@ impl Table {
             .collect();
         names.sort();
         names
+    }
+
+    pub fn collect_visible_rows(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<Vec<(RowID, RowData)>, DataBaseErrors> {
+        let mut rows = Vec::new();
+        self.for_each_visible_row(transaction, |row_id, data| {
+            rows.push((row_id, data));
+            Ok(())
+        })?;
+        Ok(rows)
+    }
+
+    pub fn lookup_rows_by_column_value(
+        &self,
+        column_id: ColumnID,
+        value: &DataBaseDataEntry,
+        transaction: &Transaction,
+    ) -> Result<Vec<RowID>, DataBaseErrors> {
+        let column = self.columns.get(&column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError("Column not found while resolving join lookup".into())
+        })?;
+        let guard = column.read().map_err(|_| {
+            DataBaseErrors::QueryError("Failed to acquire column read lock".into())
+        })?;
+
+        if let Some(row_ids) = guard.index_lookup(value, transaction) {
+            return self.filter_visible_index_candidates(row_ids, transaction);
+        }
+
+        let mut matches = Vec::new();
+        self.for_each_visible_row(transaction, |row_id, data| {
+            if data
+                .get(&column_id)
+                .map(|entry| entry == value)
+                .unwrap_or(false)
+            {
+                matches.push(row_id);
+            }
+            Ok(())
+        })?;
+        Ok(matches)
+    }
+
+    pub fn column_is_indexed(
+        &self,
+        column_name: &str,
+        transaction: &Transaction,
+    ) -> Result<bool, DataBaseErrors> {
+        let column_map = self.get_visible_column_map(transaction)?;
+        let column_id = column_map.get(&column_name.to_ascii_lowercase()).ok_or_else(|| {
+            DataBaseErrors::QueryError(format!("Column '{column_name}' not found"))
+        })?;
+        let column = self.columns.get(column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError(format!("Column '{column_name}' not found"))
+        })?;
+        let guard = column
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column read lock".into()))?;
+        Ok(guard.is_indexed(transaction))
     }
 
     pub fn get_visible_column_map(
@@ -1090,10 +1510,39 @@ impl Table {
         Ok(visible_columns)
     }
 
+    fn index_lookup_candidates(
+        &self,
+        column_name: &str,
+        value: &DataBaseDataEntry,
+        transaction: &Transaction,
+        visible_columns: &HashMap<String, ColumnID>,
+    ) -> Result<Option<BTreeSet<RowID>>, DataBaseErrors> {
+        let Some(column_id) = visible_columns.get(column_name) else {
+            return Ok(None);
+        };
+        let column = self.columns.get(column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError(format!(
+                "Column '{column_name}' not found while resolving index lookup",
+            ))
+        })?;
+        let guard = column
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column read lock".into()))?;
+        Ok(guard
+            .index_lookup(value, transaction)
+            .map(|ids| ids.into_iter().collect::<BTreeSet<RowID>>())
+            .map(|ids| {
+                self.filter_visible_index_candidates(ids.into_iter().collect(), transaction)
+            })
+            .transpose()?
+            .map(|ids| ids.into_iter().collect()))
+    }
+
     pub fn search(
         &self,
         request: &SearchRequest,
         transaction: &Transaction,
+        access_path: Option<&AccessPath>,
     ) -> Result<Vec<SearchResult>, DataBaseErrors> {
         let visible_columns: HashMap<String, ColumnID> = self
             .columns
@@ -1110,14 +1559,21 @@ impl Table {
         let projection_columns: Vec<(String, ColumnID)> = match &request.projection {
             Some(projection) => projection
                 .iter()
-                .map(|column_name| {
+                .map(|column| {
+                    if column.table_alias.is_some() {
+                        return Err(DataBaseErrors::QueryError(format!(
+                            "Qualified column '{}' is only supported in JOIN queries",
+                            column.column_name
+                        )));
+                    }
                     visible_columns
-                        .get(column_name)
+                        .get(&column.column_name)
                         .cloned()
-                        .map(|id| (column_name.clone(), id))
+                        .map(|id| (column.output_name.clone(), id))
                         .ok_or_else(|| {
                             DataBaseErrors::QueryError(format!(
-                                "Projection column '{column_name}' not found",
+                                "Projection column '{}' not found",
+                                column.column_name
                             ))
                         })
                 })
@@ -1146,43 +1602,48 @@ impl Table {
             })
             .collect::<Result<Vec<_>, DataBaseErrors>>()?;
 
-        let mut rows: Vec<(RowID, AHashMap<ColumnID, DataBaseDataEntry>)> = Vec::new();
+        let mut matching_row_ids: Vec<RowID> = Vec::new();
 
-        let candidate_row_ids: Option<BTreeSet<RowID>> =
-            if let Some(filter) = &request.filter {
-                if let Some((column_name, value)) = filter.equality_lookup() {
-                    if let Some(column_id) = visible_columns.get(column_name) {
-                        let column = self.columns.get(column_id).ok_or_else(|| {
-                            DataBaseErrors::QueryError(format!(
-                                "Column '{column_name}' not found while resolving index lookup",
-                            ))
-                        })?;
-                        let guard = column.read().map_err(|_| {
-                            DataBaseErrors::QueryError("Failed to acquire column read lock".into())
-                        })?;
-                        guard
-                            .index_lookup(value, transaction)
-                            .map(|ids| ids.into_iter().collect())
+        let candidate_row_ids: Option<BTreeSet<RowID>> = match access_path {
+            Some(AccessPath::SeqScan) => None,
+            Some(AccessPath::IndexEquality { column_name, value }) => {
+                self.index_lookup_candidates(column_name, value, transaction, &visible_columns)?
+            }
+            None => {
+                if let Some(filter) = &request.filter {
+                    if let Some((column_name, value)) = filter.equality_lookup() {
+                        self.index_lookup_candidates(
+                            column_name,
+                            value,
+                            transaction,
+                            &visible_columns,
+                        )?
                     } else {
                         None
                     }
                 } else {
                     None
                 }
-            } else {
-                None
-            };
+            }
+        };
 
         let mut push_matching_row =
             |row_id: RowID, version: &crate::backend::core::row::InternalRow| -> Result<(), DataBaseErrors> {
+                let mut ctx = RowEvaluationContext::default();
+                for (column_name, column_id) in &visible_columns {
+                    let value = version
+                        .data
+                        .get(column_id)
+                        .cloned()
+                        .unwrap_or(DataBaseDataEntry::Null);
+                    ctx.values.insert(column_name.clone(), value);
+                }
                 let matches = match &request.filter {
-                    Some(filter) => filter.evaluate(&version.data, &visible_columns)?,
+                    Some(filter) => filter.evaluate(&ctx)?,
                     None => true,
                 };
                 if matches {
-                    let row_clone: AHashMap<ColumnID, DataBaseDataEntry> =
-                        version.data.iter().map(|(&k, v)| (k, v.clone())).collect();
-                    rows.push((row_id, row_clone));
+                    matching_row_ids.push(row_id);
                 }
                 Ok(())
             };
@@ -1220,11 +1681,17 @@ impl Table {
         }
 
         if !sort_columns.is_empty() {
-            rows.sort_by(|a, b| {
+            matching_row_ids.sort_by(|&a, &b| {
                 for (column_id, sort_by) in sort_columns.iter() {
-                    let left = a.1.get(column_id).unwrap_or(&DataBaseDataEntry::Null);
-                    let right = b.1.get(column_id).unwrap_or(&DataBaseDataEntry::Null);
-                    let order = left.cmp(right);
+                    let order = self
+                        .with_versioned_column_entry(a, *column_id, transaction, |left| {
+                            self.with_versioned_column_entry(b, *column_id, transaction, |right| {
+                                left.unwrap_or(&DataBaseDataEntry::Null)
+                                    .cmp(right.unwrap_or(&DataBaseDataEntry::Null))
+                            })
+                            .expect("matching row must remain readable during sort")
+                        })
+                        .expect("matching row must remain readable during sort");
                     if order != std::cmp::Ordering::Equal {
                         return match sort_by.order_by {
                             OrderBy::ASC => order,
@@ -1237,39 +1704,67 @@ impl Table {
         }
 
         let offset = request.offset.unwrap_or(0);
-        let results = rows
+        let results = matching_row_ids
             .into_iter()
             .skip(offset)
             .take(request.limit.unwrap_or(usize::MAX))
-            .map(|(row_id, row_data)| {
+            .map(|row_id| {
+                let page = self.page_for_row(row_id)?;
+                let page_guard = page.read().map_err(|_| {
+                    DataBaseErrors::QueryError("Failed to acquire page read lock".into())
+                })?;
+                let version = page_guard
+                    .rows
+                    .get(&row_id)
+                    .and_then(|row| row.get_versioned_row(transaction))
+                    .ok_or(DataBaseErrors::RowNotFound(row_id))?;
                 let mut values = AHashMap::new();
                 for (column_name, column_id) in &projection_columns {
-                    let value = row_data
+                    let value = version
+                        .data
                         .get(column_id)
                         .cloned()
                         .unwrap_or(DataBaseDataEntry::Null);
                     values.insert(column_name.clone(), value);
                 }
-                SearchResult { row_id, values }
+                Ok(SearchResult { row_id, values })
             })
-            .collect();
+            .collect::<Result<Vec<_>, DataBaseErrors>>()?;
 
         Ok(results)
     }
 
-    pub fn prune(&mut self, oldest_active_txn: TransactionID) {
-        for column in self.columns.values() {
-            column.write().unwrap().prune(oldest_active_txn);
-        }
-
+    /// Drop MVCC versions and index entries that are no longer visible to any
+    /// active transaction. Does not repack pages.
+    pub fn prune_versions(&mut self, oldest_active_txn: TransactionID) {
         if let Ok(row_space) = self.row_space.read() {
             for page in row_space.values() {
                 page.write().unwrap().rows.retain(|_, row| {
                     row.prune(oldest_active_txn);
-                    true
+                    !row.get_raw_rows().is_empty()
                 });
             }
         }
+
+        let column_handles: Vec<_> = self.columns.values().cloned().collect();
+        for column in column_handles {
+            column.write().unwrap().prune(oldest_active_txn, &mut |row_id| {
+                self.row_is_alive_for_prune(row_id, oldest_active_txn)
+            });
+        }
+    }
+
+    /// Full vacuum: prune stale versions/index entries, then compact pages and flush.
+    pub fn prune(&mut self, oldest_active_txn: TransactionID) {
+        if let Err(err) = self.materialize_all_pages() {
+            error!(
+                "Failed to materialize pages for table '{}' before vacuum: {err}",
+                self.name
+            );
+            return;
+        }
+
+        self.prune_versions(oldest_active_txn);
 
         // Vacuum reclaims the holes left behind by deletes/pruned versions by
         // repacking the surviving rows densely, in insertion order, into fresh
@@ -1387,13 +1882,24 @@ impl Table {
 
     pub fn rollback_transaction(&mut self, transaction: &Transaction) {
         for column in self.columns.values() {
-            column.write().unwrap().rollback_transaction(transaction);
+            column
+                .write()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column write lock".into()))
+                .expect("column rollback lock poisoned")
+                .rollback_transaction(transaction);
         }
-        if let Ok(row_space) = self.row_space.read() {
-            for page in row_space.values() {
-                for row in page.write().unwrap().rows.values_mut() {
-                    row.rollback_transaction(transaction);
-                }
+        let row_space = self
+            .row_space
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space read lock".into()))
+            .expect("row_space rollback lock poisoned");
+        for page in row_space.values() {
+            let mut page_guard = page
+                .write()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page write lock".into()))
+                .expect("page rollback lock poisoned");
+            for row in page_guard.rows.values_mut() {
+                row.rollback_transaction(transaction);
             }
         }
     }

@@ -58,7 +58,7 @@ pub fn setup() -> (
             let interval = Duration::from_secs(auto_vacuum_interval_secs.max(1));
             loop {
                 tokio::time::sleep(interval).await;
-                if let Ok(mut database) = db_for_vacuum.write() {
+                if let Ok(database) = db_for_vacuum.read() {
                     database.auto_vacuum();
                     if let Err(err) = database.save_snapshot(&snapshot_path) {
                         error!("Failed to save database snapshot: {err}");

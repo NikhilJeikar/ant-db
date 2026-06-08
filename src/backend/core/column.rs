@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,29 @@ pub enum DataBaseDataType {
     Bytes,
 }
 
+impl DataBaseDataType {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Null => "NULL",
+            Self::IntegerU8 => "INTEGER U8",
+            Self::IntegerU16 => "INTEGER U16",
+            Self::IntegerU32 => "INTEGER U32",
+            Self::IntegerU64 => "INTEGER U64",
+            Self::IntegerU128 => "INTEGER U128",
+            Self::IntegerI8 => "INTEGER I8",
+            Self::IntegerI16 => "INTEGER I16",
+            Self::IntegerI32 => "INTEGER I32",
+            Self::IntegerI64 => "INTEGER I64",
+            Self::IntegerI128 => "INTEGER I128",
+            Self::FloatF32 => "FLOAT F32",
+            Self::FloatF64 => "FLOAT F64",
+            Self::String => "TEXT",
+            Self::Boolean => "BOOLEAN",
+            Self::Bytes => "BYTES",
+        }
+    }
+}
+
 pub type ColumnID = u16;
 pub type HashType = u64;
 
@@ -51,6 +74,10 @@ pub struct InternalColumn {
     pub data_type: DataBaseDataType,
     constraints: BTreeSet<Constraint>,
     index: Option<BTreeMap<HashType, BTreeSet<RowID>>>,
+    /// Tracks which transaction inserted each index entry so rollbacks can
+    /// undo uncommitted additions without eager deletes.
+    #[serde(default)]
+    index_added_by: HashMap<(HashType, RowID), TransactionID>,
     is_nullable: bool,
 }
 
@@ -81,6 +108,7 @@ impl InternalColumn {
             data_type,
             constraints,
             index: index,
+            index_added_by: HashMap::new(),
             is_nullable,
         }
     }
@@ -89,41 +117,46 @@ impl InternalColumn {
         self.index.is_some()
     }
 
+    pub fn is_nullable(&self) -> bool {
+        self.is_nullable
+    }
+
     pub fn index_lookup(&self, value: &DataBaseDataEntry) -> Option<&BTreeSet<RowID>> {
         self.index
             .as_ref()
             .and_then(|index| index.get(&value.key(self.column_id)))
     }
 
-    pub fn create_index(
+    pub fn index_row(
         &mut self,
-        rows: &HashMap<RowID, Row>,
+        row_id: RowID,
+        row: &Row,
         transaction: &Transaction,
-    ) -> Result<usize, DataBaseErrors> {
+    ) -> bool {
+        let Some(index) = self.index.as_mut() else {
+            return false;
+        };
+        if let Some(version) = row.get_versioned_row(transaction) {
+            if let Some(value) = version.data.get(&self.column_id) {
+                index
+                    .entry(value.key(self.column_id))
+                    .or_default()
+                    .insert(row_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn ensure_index_empty(&mut self) -> Result<(), DataBaseErrors> {
         if let Some(index) = &self.index {
             if !index.is_empty() {
                 return Err(DataBaseErrors::IndexExist(self.name.clone()));
             }
+        } else {
+            self.index = Some(BTreeMap::new());
         }
-
-        let mut index: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-        let mut indexed = 0usize;
-
-        for (row_id, row) in rows {
-            if let Some(version) = row.get_versioned_row(transaction) {
-                if let Some(value) = version.data.get(&self.column_id) {
-                    index
-                        .entry(value.key(self.column_id))
-                        .or_default()
-                        .insert(*row_id);
-                    indexed += 1;
-                }
-            }
-        }
-
-        self.index = Some(index);
-
-        Ok(indexed)
+        Ok(())
     }
 
     pub fn drop_index(&mut self) {
@@ -135,13 +168,14 @@ impl InternalColumn {
         column_id: ColumnID,
         value: DataBaseDataEntry,
         row_id: RowID,
+        transaction_id: TransactionID,
     ) {
-        match self.index.as_mut() {
-            Some(index) => {
-                index.entry(value.key(column_id)).or_default().insert(row_id);
-            }
-            None => {}
-        }
+        let Some(index) = self.index.as_mut() else {
+            return;
+        };
+        let key = value.key(column_id);
+        index.entry(key).or_default().insert(row_id);
+        self.index_added_by.insert((key, row_id), transaction_id);
     }
 
     pub fn remove_from_index(
@@ -160,27 +194,58 @@ impl InternalColumn {
                 index.remove(&key);
             }
         }
+        self.index_added_by.remove(&(key, row_id));
     }
 
-    pub fn prune(&mut self, oldest_active_txn: TransactionID, rows: &HashMap<RowID, Row>) {
+    pub fn rollback_index_transaction(&mut self, transaction_id: TransactionID) {
+        let to_remove: Vec<(HashType, RowID)> = self
+            .index_added_by
+            .iter()
+            .filter_map(|(&(key, row_id), &added_by)| {
+                if added_by == transaction_id {
+                    Some((key, row_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let Some(index) = self.index.as_mut() else {
+            self.index_added_by
+                .retain(|_, added_by| *added_by != transaction_id);
+            return;
+        };
+
+        for (key, row_id) in to_remove {
+            if let Some(row_ids) = index.get_mut(&key) {
+                row_ids.remove(&row_id);
+                if row_ids.is_empty() {
+                    index.remove(&key);
+                }
+            }
+            self.index_added_by.remove(&(key, row_id));
+        }
+    }
+
+    pub fn prune<F>(&mut self, oldest_active_txn: TransactionID, is_alive: &mut F)
+    where
+        F: FnMut(RowID) -> bool,
+    {
         let Some(index) = &mut self.index else {
             return;
         };
 
         let mut empty_keys = Vec::new();
 
+        let mut removed_entries = HashSet::new();
+
         for (key, row_ids) in index.iter_mut() {
             row_ids.retain(|row_id| {
-                if let Some(row) = rows.get(row_id) {
-                    row.get_raw_rows().iter().any(|version| {
-                        match version.transaction_header.deleted_by {
-                            None => true, // still alive
-                            Some(del) => del >= oldest_active_txn,
-                        }
-                    })
-                } else {
-                    false // row missing
+                let alive = is_alive(*row_id);
+                if !alive {
+                    removed_entries.insert((*key, *row_id));
                 }
+                alive
             });
 
             if row_ids.is_empty() {
@@ -191,15 +256,24 @@ impl InternalColumn {
         for key in empty_keys {
             index.remove(&key);
         }
+
+        for entry in removed_entries {
+            self.index_added_by.remove(&entry);
+        }
     }
 
-    pub fn schema_validation(
+    pub fn schema_validation<F, G>(
         &self,
         value: &DataBaseDataEntry,
-        rows: &HashMap<RowID, Row>,
-        transaction: &Transaction,
+        mut lookup: F,
+        fk_lookup: &mut G,
+        _transaction: &Transaction,
         exclude_row_id: Option<RowID>,
-    ) -> Result<(), DataBaseErrors> {
+    ) -> Result<(), DataBaseErrors>
+    where
+        F: FnMut(RowID) -> Result<Option<DataBaseDataEntry>, DataBaseErrors>,
+        G: FnMut(TableID, ColumnID, &DataBaseDataEntry) -> Result<bool, DataBaseErrors>,
+    {
         for constraints in &self.constraints {
             match constraints {
                 Constraint::NotNull => {
@@ -216,31 +290,11 @@ impl InternalColumn {
                                     if Some(*row_id) == exclude_row_id {
                                         continue;
                                     }
-                                    match rows.get(row_id) {
-                                        Some(versioned_row) => {
-                                            match versioned_row.get_versioned_row(transaction) {
-                                                Some(row) => {
-                                                    if let Some(lookup_value) =
-                                                        row.data.get(&self.column_id)
-                                                    {
-                                                        if lookup_value == value {
-                                                            return Err(
-                                                                DataBaseErrors::UniqueConstraint(
-                                                                    self.name.clone(),
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                None => {
-                                                    return Err(DataBaseErrors::RowNotFound(
-                                                        *row_id,
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            return Err(DataBaseErrors::RowNotFound(*row_id));
+                                    if let Some(lookup_value) = lookup(*row_id)? {
+                                        if lookup_value == *value {
+                                            return Err(DataBaseErrors::UniqueConstraint(
+                                                self.name.clone(),
+                                            ));
                                         }
                                     }
                                 }
@@ -252,13 +306,23 @@ impl InternalColumn {
                     }
                 }
                 Constraint::ForeignKey {
-                    refered_table_id: _,
-                    refered_column_id: _,
+                    refered_table_id,
+                    refered_column_id,
                 } => {
-                    //TODO: Implement it as part of the Database overhaul
+                    if value.is_null() {
+                        continue;
+                    }
+                    if !fk_lookup(*refered_table_id, *refered_column_id, value)? {
+                        return Err(DataBaseErrors::ForeignKeyViolation(self.name.clone()));
+                    }
                 }
                 Constraint::Check => {
-                    //TODO: Implement it as part of the Check logic sepratly
+                    if value.is_null() {
+                        continue;
+                    }
+                    return Err(DataBaseErrors::CheckConstraintUnsupported(
+                        self.name.clone(),
+                    ));
                 }
                 Constraint::AutoIncrement => {
                     //NOTE: This is not validation this is a property so this won't be implented here rather create a preprocessing before schema validation and enter it through there
@@ -358,22 +422,29 @@ impl Column {
             data_type: data_type.unwrap_or(current.data_type.clone()),
             constraints: new_constraints,
             index,
+            index_added_by: current.index_added_by.clone(),
             is_nullable,
         };
 
         self.versions.push(new_column);
     }
 
-    pub fn prune(&mut self, oldest_active_txn: TransactionID) {
+    pub fn prune<F>(&mut self, oldest_active_txn: TransactionID, is_alive: &mut F)
+    where
+        F: FnMut(RowID) -> bool,
+    {
         self.versions
             .retain(|row| match row.transaction_header.deleted_by {
                 None => true,
                 Some(del) => del >= oldest_active_txn,
             });
+        self.prune_index(oldest_active_txn, is_alive);
     }
 
     pub fn rollback_transaction(&mut self, transaction: &Transaction) {
         for version in self.versions.iter_mut() {
+            version.rollback_index_transaction(transaction.transaction_id);
+
             if version.transaction_header.created_by == transaction.transaction_id {
                 if version.transaction_header.deleted_by.is_none() {
                     version.transaction_header.deleted_by = Some(transaction.transaction_id);
@@ -417,17 +488,57 @@ impl Column {
             .find(|column| column.transaction_header.is_visible(transaction))
     }
 
-    pub fn create_index(
+    pub fn ensure_index_ready(
         &mut self,
-        rows: &HashMap<RowID, Row>,
         transaction: &Transaction,
-    ) -> Result<usize, DataBaseErrors> {
+    ) -> Result<(), DataBaseErrors> {
         let Some(version) = self.get_versioned_column_mut(transaction) else {
             return Err(DataBaseErrors::QueryError(
                 "No visible column version found while building index".into(),
             ));
         };
-        version.create_index(rows, transaction)
+        version.ensure_index_empty()
+    }
+
+    pub fn index_row(
+        &mut self,
+        row_id: RowID,
+        row: &Row,
+        transaction: &Transaction,
+    ) -> bool {
+        self.get_versioned_column_mut(transaction)
+            .map(|version| version.index_row(row_id, row, transaction))
+            .unwrap_or(false)
+    }
+
+    pub fn drop_index(&mut self, transaction: &Transaction) -> Result<(), DataBaseErrors> {
+        let Some(version) = self.get_versioned_column_mut(transaction) else {
+            return Err(DataBaseErrors::QueryError(
+                "No visible column version found while dropping index".into(),
+            ));
+        };
+        let constraints = version.constraints.clone();
+        if constraints.contains(&Constraint::PrimaryKey) || constraints.contains(&Constraint::Unique)
+        {
+            return Err(DataBaseErrors::QueryError(format!(
+                "Cannot drop index on column '{}' because it enforces a PRIMARY KEY or UNIQUE constraint",
+                version.name
+            )));
+        }
+        if version.index.is_none() {
+            return Err(DataBaseErrors::IndexNotFound(version.name.clone()));
+        }
+        version.drop_index();
+        Ok(())
+    }
+
+    pub fn prune_index<F>(&mut self, oldest_active_txn: TransactionID, is_alive: &mut F)
+    where
+        F: FnMut(RowID) -> bool,
+    {
+        for version in self.versions.iter_mut() {
+            version.prune(oldest_active_txn, is_alive);
+        }
     }
 
     pub fn update_index(
@@ -438,33 +549,26 @@ impl Column {
         transaction: &Transaction,
     ) {
         if let Some(version) = self.get_versioned_column_mut(transaction) {
-            version.update_index(column_id, value, row_id);
+            version.update_index(column_id, value, row_id, transaction.transaction_id);
         }
     }
 
-    pub fn remove_from_index(
-        &mut self,
-        column_id: ColumnID,
-        value: &DataBaseDataEntry,
-        row_id: RowID,
-        transaction: &Transaction,
-    ) {
-        if let Some(version) = self.get_versioned_column_mut(transaction) {
-            version.remove_from_index(column_id, value, row_id);
-        }
-    }
-
-    pub fn schema_validation(
+    pub fn schema_validation<F, G>(
         &self,
         value: &DataBaseDataEntry,
-        rows: &HashMap<RowID, Row>,
+        lookup: F,
+        fk_lookup: &mut G,
         transaction: &Transaction,
         exclude_row_id: Option<RowID>,
-    ) -> Result<(), DataBaseErrors> {
+    ) -> Result<(), DataBaseErrors>
+    where
+        F: FnMut(RowID) -> Result<Option<DataBaseDataEntry>, DataBaseErrors>,
+        G: FnMut(TableID, ColumnID, &DataBaseDataEntry) -> Result<bool, DataBaseErrors>,
+    {
         let Some(version) = self.get_versioned_column(transaction) else {
             return Ok(());
         };
-        version.schema_validation(value, rows, transaction, exclude_row_id)
+        version.schema_validation(value, lookup, fk_lookup, transaction, exclude_row_id)
     }
 
     pub fn is_indexed(&self, transaction: &Transaction) -> bool {
