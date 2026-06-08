@@ -214,6 +214,10 @@ pub struct Table {
     #[serde(skip)]
     evicted_pages: RwLock<BTreeSet<PageID>>,
 
+    /// Page IDs known to be present in the on-disk table file.
+    #[serde(skip)]
+    on_disk_pages: RwLock<BTreeSet<PageID>>,
+
     /// Tracks last-access ordering for in-memory pages.
     #[serde(skip)]
     lru: RwLock<BTreeMap<PageID, u64>>,
@@ -248,6 +252,11 @@ impl Clone for Table {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let on_disk_pages = self
+            .on_disk_pages
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let lru = self.lru.read().map(|guard| guard.clone()).unwrap_or_default();
         Self {
             table_id: self.table_id,
@@ -261,6 +270,7 @@ impl Clone for Table {
             next_column_id: AtomicU16::new(self.next_column_id.load(Ordering::SeqCst)),
             page_size: self.page_size,
             evicted_pages: RwLock::new(evicted_pages),
+            on_disk_pages: RwLock::new(on_disk_pages),
             lru: RwLock::new(lru),
             lru_counter: AtomicU64::new(self.lru_counter.load(Ordering::SeqCst)),
             memory_used: AtomicU64::new(self.memory_used.load(Ordering::SeqCst)),
@@ -296,6 +306,20 @@ impl Table {
         }
         self.refresh_page_store();
         self.rebuild_runtime_state();
+        if let Err(err) = self.sync_on_disk_pages_from_store() {
+            error!(
+                "Failed to sync on-disk page index for table '{}': {err}",
+                self.name
+            );
+        }
+    }
+
+    fn sync_on_disk_pages_from_store(&self) -> Result<(), DataBaseErrors> {
+        let pages = self.page_store.read_all()?;
+        if let Ok(mut on_disk) = self.on_disk_pages.write() {
+            *on_disk = pages.keys().copied().collect();
+        }
+        Ok(())
     }
 
     fn memory_limit(&self) -> u64 {
@@ -365,12 +389,32 @@ impl Table {
         }
     }
 
-    fn page_is_on_disk(&self, page_id: PageID) -> Result<bool, DataBaseErrors> {
-        Ok(self.page_store.read_page(page_id)?.is_some())
+    fn page_is_on_disk(&self, page_id: PageID) -> bool {
+        self.on_disk_pages
+            .read()
+            .map(|pages| pages.contains(&page_id))
+            .unwrap_or(false)
+    }
+
+    fn mark_pages_on_disk(&self, page_ids: impl IntoIterator<Item = PageID>) {
+        if let Ok(mut on_disk) = self.on_disk_pages.write() {
+            on_disk.extend(page_ids);
+        }
+    }
+
+    fn write_pages_to_disk(&self, pages: &BTreeMap<PageID, Page>) -> Result<(), DataBaseErrors> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        self.page_store.merge_pages(pages)?;
+        self.mark_pages_on_disk(pages.keys().copied());
+        Ok(())
     }
 
     fn write_page_to_disk(&self, page: &Page) -> Result<(), DataBaseErrors> {
-        self.page_store.upsert_page(page)
+        let mut pages = BTreeMap::new();
+        pages.insert(page.id(), page.clone());
+        self.write_pages_to_disk(&pages)
     }
 
     fn load_page_from_disk(&self, page_id: PageID) -> Result<Page, DataBaseErrors> {
@@ -404,7 +448,7 @@ impl Table {
         let page = page_arc
             .read()
             .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page read lock".into()))?;
-        if page.is_dirty || !self.page_is_on_disk(page_id)? {
+        if page.is_dirty || !self.page_is_on_disk(page_id) {
             self.write_page_to_disk(&page)?;
         }
         self.untrack_page_in_memory(page_id, &page);
@@ -486,15 +530,16 @@ impl Table {
             .row_space
             .read()
             .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space read lock".into()))?;
+        let mut updates = BTreeMap::new();
         for page_arc in row_space.values() {
             let page = page_arc
                 .read()
                 .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page read lock".into()))?;
             if page.is_dirty {
-                self.write_page_to_disk(&page)?;
+                updates.insert(page.id(), page.clone());
             }
         }
-        Ok(())
+        self.write_pages_to_disk(&updates)
     }
 
     pub fn flush_all_pages(&self) -> Result<(), DataBaseErrors> {
@@ -517,6 +562,9 @@ impl Table {
         }
 
         self.page_store.write_all(&pages_on_disk)?;
+        if let Ok(mut on_disk) = self.on_disk_pages.write() {
+            *on_disk = pages_on_disk.keys().copied().collect();
+        }
         Ok(())
     }
 
@@ -553,6 +601,7 @@ impl Table {
             next_column_id: AtomicU16::new(0),
             page_size,
             evicted_pages: RwLock::new(BTreeSet::new()),
+            on_disk_pages: RwLock::new(BTreeSet::new()),
             lru: RwLock::new(BTreeMap::new()),
             lru_counter: AtomicU64::new(0),
             memory_used: AtomicU64::new(0),
@@ -1148,6 +1197,9 @@ impl Table {
         drop(row_locations);
         if let Ok(mut evicted) = self.evicted_pages.write() {
             evicted.clear();
+        }
+        if let Ok(mut on_disk) = self.on_disk_pages.write() {
+            on_disk.clear();
         }
         self.rebuild_runtime_state();
     }

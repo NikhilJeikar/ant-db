@@ -1,7 +1,7 @@
 /target
 *.log
 *.wal
-*.db
+db/*
 
 */.venv/*
 *.pyc

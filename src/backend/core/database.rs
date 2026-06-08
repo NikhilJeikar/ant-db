@@ -1,5 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::error;
@@ -85,17 +87,51 @@ impl Database {
         }
     }
 
-    fn persist_all_dirty_pages(&self) {
+    /// Restore database state from a snapshot file, if one exists.
+    pub fn load_from_snapshot(
+        path: &str,
+        expected_name: &str,
+        internal_state_manager: Arc<RwLock<InternalStateManager>>,
+    ) -> Result<Option<Self>, DataBaseErrors> {
+        if !Path::new(path).exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let mut db: Database = bincode::deserialize(&bytes)
+            .map_err(|e| DataBaseErrors::DeserializationError(e.to_string()))?;
+        if db.name != expected_name {
+            return Err(DataBaseErrors::QueryError(format!(
+                "Snapshot database name '{}' does not match configured database '{}'",
+                db.name, expected_name
+            )));
+        }
+        db.internal_state_manager = internal_state_manager;
+        db.transaction_snapshot = Arc::new(RwLock::new(TransactionSnapshot::default()));
+        db.bind_tables();
+        Ok(Some(db))
+    }
+
+    /// Persist the full database metadata and in-memory state to disk.
+    pub fn save_snapshot(&self, path: &str) -> Result<(), DataBaseErrors> {
         for table in self.tables.values() {
             if let Ok(table) = table.read() {
-                if let Err(err) = table.persist_dirty_pages() {
-                    error!(
-                        "Failed to persist dirty pages for table '{}': {err}",
-                        table.name()
-                    );
-                }
+                table.flush_all_pages()?;
             }
         }
+        let bytes = bincode::serialize(self)
+            .map_err(|e| DataBaseErrors::SerializationError(e.to_string()))?;
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+            }
+        }
+        let tmp_path = Path::new(path).with_extension("tmp");
+        fs::write(&tmp_path, bytes).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        fs::rename(&tmp_path, path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        Ok(())
     }
 
     pub fn create_table(&mut self, table_name: String) -> Result<TableID, DataBaseErrors> {
@@ -179,7 +215,6 @@ impl Database {
                 .unwrap()
                 .clone();
         }
-        self.persist_all_dirty_pages();
     }
 
     pub fn rollback_transaction(&mut self, transaction: &Transaction) {
@@ -264,7 +299,7 @@ mod tests {
     use super::Database;
 
     #[test]
-    fn dirty_pages_are_written_on_commit() {
+    fn dirty_pages_are_written_on_flush() {
         let dir = std::env::temp_dir().join(format!("ant-db-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -293,6 +328,11 @@ mod tests {
         data.insert(0, DataBaseDataEntry::IntegerU64(42));
         table.read().unwrap().insert_row(data, &txn).unwrap();
         db.commit_transaction(txn.transaction_id);
+        table
+            .read()
+            .unwrap()
+            .flush_all_pages()
+            .expect("flush should write dirty pages to disk");
 
         let expected = dir.join("testdb-users");
         assert!(
@@ -301,6 +341,55 @@ mod tests {
             expected.display()
         );
         assert!(expected.metadata().unwrap().len() > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_restores_tables() {
+        let dir = std::env::temp_dir().join(format!("ant-db-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let snapshot_path = dir.join("snapshot.db");
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+        config.snapshot_path = snapshot_path.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config.clone())));
+        let mut db = Database::new("testdb".to_string(), ism.clone());
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        table
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let mut data = AHashMap::new();
+        data.insert(0, DataBaseDataEntry::IntegerU64(42));
+        table.read().unwrap().insert_row(data, &txn).unwrap();
+        db.commit_transaction(txn.transaction_id);
+
+        db.save_snapshot(&snapshot_path.to_string_lossy()).unwrap();
+
+        let loaded = Database::load_from_snapshot(
+            &snapshot_path.to_string_lossy(),
+            "testdb",
+            ism,
+        )
+        .unwrap()
+        .expect("snapshot should load");
+
+        assert!(loaded.get_table("users".to_string()).is_some());
+        assert_eq!(loaded.tables.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

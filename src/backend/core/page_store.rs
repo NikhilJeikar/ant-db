@@ -45,9 +45,13 @@ impl PageStore {
         Ok(())
     }
 
-    pub fn upsert_page(&self, page: &Page) -> Result<(), DataBaseErrors> {
+    /// Merge one or more pages into the on-disk file with a single read/write pass.
+    pub fn merge_pages(&self, updates: &BTreeMap<PageID, Page>) -> Result<(), DataBaseErrors> {
+        if updates.is_empty() {
+            return Ok(());
+        }
         let mut pages = self.read_all()?;
-        pages.insert(page.id(), page.clone());
+        pages.extend(updates.iter().map(|(page_id, page)| (*page_id, page.clone())));
         self.write_all(&pages)
     }
 
