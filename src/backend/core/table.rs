@@ -165,6 +165,11 @@ impl Page {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(page_id: PageID, capacity: u64) -> Self {
+        Self::new(page_id, capacity)
+    }
+
     /// Whether a row of `size` bytes can still be appended to this page.
     fn has_room_for(&self, size: u64) -> bool {
         !self.is_overflow && self.used_bytes.saturating_add(size) <= self.capacity
@@ -315,9 +320,9 @@ impl Table {
     }
 
     fn sync_on_disk_pages_from_store(&self) -> Result<(), DataBaseErrors> {
-        let pages = self.page_store.read_all()?;
+        let page_ids = self.page_store.list_page_ids()?;
         if let Ok(mut on_disk) = self.on_disk_pages.write() {
-            *on_disk = pages.keys().copied().collect();
+            *on_disk = page_ids.into_iter().collect();
         }
         Ok(())
     }
