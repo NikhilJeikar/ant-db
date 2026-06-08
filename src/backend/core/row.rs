@@ -1,3 +1,4 @@
+use ahash::AHashMap;
 use ordered_float::NotNan;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
@@ -53,43 +54,39 @@ impl DataBaseDataEntry {
             DataBaseDataEntry::Bytes(_) => DataBaseDataType::Bytes,
         }
     }
-}
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Cell {
-    pub column_id: ColumnID,
-    pub data: DataBaseDataEntry,
-}
-
-impl Cell {
-    pub fn key(&self) -> HashType {
+    pub fn key(&self, column_id: ColumnID) -> HashType {
         let mut hasher = XxHash64::with_seed(0);
+        column_id.hash(&mut hasher);
         self.hash(&mut hasher);
         hasher.finish()
     }
 
     pub fn is_null(&self) -> bool {
-        matches!(self.data, DataBaseDataEntry::Null)
+        matches!(self, DataBaseDataEntry::Null)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct InternalRow {
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct InternalRow {
     pub transaction_header: TransactionHeader,
-    pub data: Vec<Cell>,
+    pub data: AHashMap<ColumnID, DataBaseDataEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Row {
     versions: Vec<InternalRow>,
 }
 
 impl Row {
-    pub fn new(transaction_id: TransactionID, data: Vec<Cell>) -> Self {
+    pub fn new(
+        transaction: &Transaction,
+        data: AHashMap<ColumnID, DataBaseDataEntry>,
+    ) -> Self {
         let mut row = Row { versions: Vec::new() };
         row.versions.push(InternalRow {
             transaction_header: TransactionHeader {
-                created_by: transaction_id,
+                created_by: transaction.transaction_id,
                 deleted_by: None,
             },
             data,
@@ -106,7 +103,11 @@ impl Row {
         }
     }
 
-    pub fn update(&mut self, transaction: &Transaction, data: Vec<Cell>) {
+    pub fn update(
+        &mut self,
+        transaction: &Transaction,
+        data: AHashMap<ColumnID, DataBaseDataEntry>,
+    ) {
         for row in self.versions.iter_mut().rev() {
             if row.transaction_header.is_visible(transaction) {
                 row.transaction_header.deleted_by = Some(transaction.transaction_id);
@@ -128,6 +129,22 @@ impl Row {
             None => true,
             Some(del) => del >= oldest_active_txn,
         });
+    }
+
+    pub fn rollback_transaction(&mut self, transaction: &Transaction) {
+        for version in self.versions.iter_mut() {
+            if version.transaction_header.created_by == transaction.transaction_id {
+                if version.transaction_header.deleted_by.is_none() {
+                    version.transaction_header.deleted_by = Some(transaction.transaction_id);
+                }
+            }
+
+            if version.transaction_header.deleted_by == Some(transaction.transaction_id)
+                && version.transaction_header.created_by != transaction.transaction_id
+            {
+                version.transaction_header.deleted_by = None;
+            }
+        }
     }
 
     pub fn get_raw_rows(&self) -> &Vec<InternalRow> {

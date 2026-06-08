@@ -1,16 +1,14 @@
+use crate::backend::core::pg_wire::run_pgwire_server;
 use crate::backend::handler::setup;
 use tracing::info;
 mod backend;
 
 #[tokio::main]
 async fn main() {
-    // Initialize database system
     info!("Initializing database system...");
-    let (_internal_state_manager, _wal_manager, db_arc, _snapshot_monitor_shutdown, _logger_handle) =
-        setup();
+    let (_internal_state_manager, db_arc, _logger_handle) = setup();
 
-    // Start the API server
-    if let Err(e) = backend::handler::start_api_server(db_arc, "127.0.0.1", 8080).await {
-        eprintln!("API server error: {}", e);
-    }
+    let server_addr = "127.0.0.1:5432";
+    info!("Starting pgwire server at {}", server_addr);
+    run_pgwire_server(db_arc, server_addr).await;
 }

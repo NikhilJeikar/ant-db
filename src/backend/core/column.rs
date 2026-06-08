@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::core::row::{Cell, Row, RowID};
+use crate::backend::core::row::{DataBaseDataEntry, Row, RowID};
 use crate::backend::core::table::TableID;
 use crate::backend::core::transaction::{Transaction, TransactionHeader, TransactionID};
 use crate::backend::errors::DataBaseErrors;
@@ -49,7 +49,7 @@ pub struct InternalColumn {
     pub column_id: ColumnID,
     pub name: String,
     pub data_type: DataBaseDataType,
-    constraint: BTreeSet<Constraint>,
+    constraints: BTreeSet<Constraint>,
     index: Option<BTreeMap<HashType, BTreeSet<RowID>>>,
     is_nullable: bool,
 }
@@ -59,15 +59,15 @@ impl InternalColumn {
         column_id: ColumnID,
         name: String,
         data_type: DataBaseDataType,
-        constraint: BTreeSet<Constraint>,
+        constraints: BTreeSet<Constraint>,
         transaction: &Transaction,
     ) -> Self {
         let mut is_nullable = true;
         let mut index = None;
-        if constraint.contains(&Constraint::NotNull) {
+        if constraints.contains(&Constraint::NotNull) {
             is_nullable = false;
         }
-        if constraint.contains(&Constraint::PrimaryKey) || constraint.contains(&Constraint::Unique)
+        if constraints.contains(&Constraint::PrimaryKey) || constraints.contains(&Constraint::Unique)
         {
             index = Some(BTreeMap::new());
         }
@@ -79,7 +79,7 @@ impl InternalColumn {
             column_id,
             name,
             data_type,
-            constraint,
+            constraints,
             index: index,
             is_nullable,
         }
@@ -94,9 +94,9 @@ impl InternalColumn {
 
         for (row_id, row) in rows {
             for version in row.get_raw_rows() {
-                for cell in &version.data {
-                    if cell.column_id == self.column_id {
-                        index.entry(cell.key()).or_default().insert(*row_id);
+                for (column_id, value) in &version.data {
+                    if *column_id == self.column_id {
+                        index.entry(value.key(*column_id)).or_default().insert(*row_id);
                         break;
                     }
                 }
@@ -112,10 +112,15 @@ impl InternalColumn {
         self.index = None;
     }
 
-    pub fn update_index(&mut self, cell: Cell, row_id: RowID) {
+    pub fn update_index(
+        &mut self,
+        column_id: ColumnID,
+        value: DataBaseDataEntry,
+        row_id: RowID,
+    ) {
         match self.index.as_mut() {
             Some(index) => {
-                index.entry(cell.key()).or_default().insert(row_id);
+                index.entry(value.key(column_id)).or_default().insert(row_id);
             }
             None => {}
         }
@@ -154,14 +159,14 @@ impl InternalColumn {
 
     pub fn schema_validation(
         &self,
-        cell: Cell,
+        value: &DataBaseDataEntry,
         rows: &HashMap<RowID, Row>,
         transaction: &Transaction,
     ) -> Result<(), DataBaseErrors> {
-        for constraint in &self.constraint {
-            match constraint {
+        for constraints in &self.constraints {
+            match constraints {
                 Constraint::NotNull => {
-                    if cell.is_null() {
+                    if value.is_null() {
                         return Err(DataBaseErrors::NullValue());
                     }
                 }
@@ -174,9 +179,9 @@ impl InternalColumn {
                                         Some(versioned_row) => {
                                             match versioned_row.get_versioned_row(transaction) {
                                                 Some(row) => {
-                                                    for lookup_cell in &row.data {
-                                                        if lookup_cell.column_id == self.column_id {
-                                                            if lookup_cell.data == cell.data {
+                                                    for (lookup_column_id, lookup_value) in &row.data {
+                                                        if *lookup_column_id == self.column_id {
+                                                            if lookup_value == value {
                                                                 return Err(DataBaseErrors::UniqueConstraint(self.name.clone()));
                                                             }
                                                             break;
@@ -220,17 +225,17 @@ impl InternalColumn {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Column {
     versions: Vec<InternalColumn>,
 }
 
 impl Column {
-    fn new(
+    pub fn new(
         column_id: ColumnID,
         name: String,
         data_type: DataBaseDataType,
-        constraint: BTreeSet<Constraint>,
+        constraints: BTreeSet<Constraint>,
         transaction: &Transaction,
     ) -> Self {
         let mut column = Column {
@@ -240,7 +245,7 @@ impl Column {
             column_id,
             name,
             data_type,
-            constraint,
+            constraints,
             transaction,
         ));
         column
@@ -259,7 +264,7 @@ impl Column {
         &mut self,
         name: Option<String>,
         data_type: Option<DataBaseDataType>,
-        constraint: Option<BTreeSet<Constraint>>,
+        constraints: Option<BTreeSet<Constraint>>,
         transaction: &Transaction,
     ) {
         let current = match self
@@ -273,17 +278,17 @@ impl Column {
             None => return,
         };
 
-        let new_constraint = constraint.unwrap_or_else(|| current.constraint.clone());
+        let new_constraints = constraints.unwrap_or_else(|| current.constraints.clone());
 
         let mut is_nullable = true;
         let mut index = current.index.clone();
 
-        if new_constraint.contains(&Constraint::NotNull) {
+        if new_constraints.contains(&Constraint::NotNull) {
             is_nullable = false;
         }
 
-        if new_constraint.contains(&Constraint::PrimaryKey)
-            || new_constraint.contains(&Constraint::Unique)
+        if new_constraints.contains(&Constraint::PrimaryKey)
+            || new_constraints.contains(&Constraint::Unique)
         {
             if index.is_none() {
                 index = Some(BTreeMap::new());
@@ -307,7 +312,7 @@ impl Column {
             column_id: current.column_id,
             name: name.unwrap_or(current.name.clone()),
             data_type: data_type.unwrap_or(current.data_type.clone()),
-            constraint: new_constraint,
+            constraints: new_constraints,
             index,
             is_nullable,
         };
@@ -323,6 +328,22 @@ impl Column {
             });
     }
 
+    pub fn rollback_transaction(&mut self, transaction: &Transaction) {
+        for version in self.versions.iter_mut() {
+            if version.transaction_header.created_by == transaction.transaction_id {
+                if version.transaction_header.deleted_by.is_none() {
+                    version.transaction_header.deleted_by = Some(transaction.transaction_id);
+                }
+            }
+
+            if version.transaction_header.deleted_by == Some(transaction.transaction_id)
+                && version.transaction_header.created_by != transaction.transaction_id
+            {
+                version.transaction_header.deleted_by = None;
+            }
+        }
+    }
+
     pub fn get_raw_columns(&self) -> &Vec<InternalColumn> {
         &self.versions
     }
@@ -332,5 +353,13 @@ impl Column {
             .iter()
             .rev()
             .find(|column| column.transaction_header.is_visible(transaction))
+    }
+
+    pub fn get_versioned_constraints(
+        &self,
+        transaction: &Transaction,
+    ) -> Option<BTreeSet<Constraint>> {
+        self.get_versioned_column(transaction)
+            .map(|version| version.constraints.clone())
     }
 }
