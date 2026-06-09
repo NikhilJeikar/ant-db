@@ -4,8 +4,9 @@ use ahash::AHashMap;
 use ordered_float::NotNan;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
-    BinaryOperator, Expr as SqlExpr, Join, JoinConstraint, JoinOperator, ObjectName, OrderBy as SqlOrderBy,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue,
+    BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Join, JoinConstraint, JoinOperator, ObjectName, OrderBy as SqlOrderBy, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -99,9 +100,16 @@ pub struct SortBy {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum AggregateProjection {
+    CountStar { output_name: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct SearchRequest {
     pub from: FromClause,
     pub projection: Option<Vec<ProjectionColumn>>,
+    #[serde(default)]
+    pub aggregate: Option<AggregateProjection>,
     pub filter: Option<SearchExpression>,
     pub order_by: Vec<SortBy>,
     pub limit: Option<usize>,
@@ -320,6 +328,7 @@ impl SearchRequest {
                 joins: Vec::new(),
             },
             projection,
+            aggregate: None,
             filter,
             order_by,
             limit,
@@ -461,10 +470,12 @@ impl SearchRequest {
                     Ok(DataBaseDataEntry::FloatF64(NotNan::new(float).map_err(|_| {
                         DataBaseErrors::QueryError("Floating point literal must not be NaN".into())
                     })?))
-                } else if let Ok(unsigned) = text.parse::<u64>() {
-                    Ok(DataBaseDataEntry::IntegerU64(unsigned))
+                } else if let Ok(signed) = text.parse::<i32>() {
+                    Ok(DataBaseDataEntry::IntegerI32(signed))
                 } else if let Ok(signed) = text.parse::<i64>() {
                     Ok(DataBaseDataEntry::IntegerI64(signed))
+                } else if let Ok(unsigned) = text.parse::<u64>() {
+                    Ok(DataBaseDataEntry::IntegerU64(unsigned))
                 } else if let Ok(unsigned128) = text.parse::<u128>() {
                     Ok(DataBaseDataEntry::IntegerU128(unsigned128))
                 } else if let Ok(signed128) = text.parse::<i128>() {
@@ -572,6 +583,45 @@ impl SearchRequest {
         }
     }
 
+    fn function_name(function: &Function) -> String {
+        function
+            .name
+            .0
+            .iter()
+            .map(|ident| ident.value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn is_count_star(function: &Function) -> bool {
+        if Self::function_name(function) != "count" {
+            return false;
+        }
+        match &function.args {
+            FunctionArguments::List(list) if list.args.len() == 1 => {
+                matches!(list.args[0], FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+            }
+            _ => false,
+        }
+    }
+
+    fn parse_aggregate_projection(item: &SelectItem) -> Result<Option<AggregateProjection>, DataBaseErrors> {
+        match item {
+            SelectItem::UnnamedExpr(SqlExpr::Function(function)) if Self::is_count_star(function) => {
+                Ok(Some(AggregateProjection::CountStar {
+                    output_name: "count".to_string(),
+                }))
+            }
+            SelectItem::ExprWithAlias {
+                expr: SqlExpr::Function(function),
+                alias,
+            } if Self::is_count_star(function) => Ok(Some(AggregateProjection::CountStar {
+                output_name: Self::normalize_identifier(&alias.value),
+            })),
+            _ => Ok(None),
+        }
+    }
+
     fn parse_projection_item(item: &SelectItem) -> Result<ProjectionColumn, DataBaseErrors> {
         match item {
             SelectItem::UnnamedExpr(expr) => {
@@ -634,20 +684,37 @@ impl SearchRequest {
 
         let from = Self::parse_from(&select.from[0])?;
 
-        let projection = if select.projection.iter().any(|item| {
+        let projection = if select.projection.len() == 1 {
+            if let Some(aggregate) = Self::parse_aggregate_projection(&select.projection[0])? {
+                (None, Some(aggregate))
+            } else if select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            }) {
+                (None, None)
+            } else {
+                (
+                    Some(vec![Self::parse_projection_item(&select.projection[0])?]),
+                    None,
+                )
+            }
+        } else if select.projection.iter().any(|item| {
             matches!(
                 item,
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
             )
         }) {
-            None
+            (None, None)
         } else {
             let mut columns = Vec::new();
             for item in &select.projection {
                 columns.push(Self::parse_projection_item(item)?);
             }
-            Some(columns)
+            (Some(columns), None)
         };
+        let (projection, aggregate) = projection;
 
         let filter = match &select.selection {
             Some(predicate) => Some(Self::parse_sql_expression(predicate)?),
@@ -672,6 +739,7 @@ impl SearchRequest {
         Ok(SearchRequest {
             from,
             projection,
+            aggregate,
             filter,
             order_by,
             limit,
@@ -706,7 +774,7 @@ mod tests {
 
         let mut ctx = RowEvaluationContext::default();
         ctx.values
-            .insert("age".into(), DataBaseDataEntry::IntegerU64(25));
+            .insert("age".into(), DataBaseDataEntry::IntegerI32(25));
         ctx.values
             .insert("active".into(), DataBaseDataEntry::Boolean(true));
 

@@ -14,6 +14,9 @@ pub const DEFAULT_AUTO_VACUUM_INTERVAL_SECS: u64 = 300;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub log_path: String,
+    /// Minimum tracing level written to log_path: trace, debug, info, warn, error.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     pub snapshot_path: String,
     /// Name of the database instance served by this process.
     pub database: String,
@@ -40,6 +43,10 @@ fn default_table_data_path() -> String {
     "db/tables".to_string()
 }
 
+fn default_log_level() -> String {
+    "warn".to_string()
+}
+
 fn default_page_size_bytes() -> u64 {
     DEFAULT_PAGE_SIZE_BYTES
 }
@@ -57,6 +64,7 @@ impl Default for Config {
         Self {
             snapshot_path: "snapshot.db".to_string(),
             log_path: "app1.log".to_string(),
+            log_level: default_log_level(),
             database: String::new(),
             table_data_path: default_table_data_path(),
             page_size_bytes: DEFAULT_PAGE_SIZE_BYTES,

@@ -30,7 +30,7 @@ pub enum PhysicalPlan {
     },
     Update {
         table_name: String,
-        assignments: Vec<(String, DataBaseDataEntry)>,
+        assignments: Vec<(String, crate::backend::core::plan::dml::UpdateAssignment)>,
         filter: Option<crate::backend::core::search::SearchExpression>,
         access_path: AccessPath,
     },

@@ -3,6 +3,7 @@ use ahash::AHashMap;
 use sqlparser::ast::ShowStatementFilter;
 
 use crate::backend::core::column::ColumnID;
+use crate::backend::core::plan::dml::UpdateAssignment;
 use crate::backend::core::row::DataBaseDataEntry;
 use crate::backend::core::search::{SearchExpression, SearchRequest};
 
@@ -16,7 +17,7 @@ pub enum LogicalPlan {
     },
     Update {
         table_name: String,
-        assignments: Vec<(String, DataBaseDataEntry)>,
+        assignments: Vec<(String, UpdateAssignment)>,
         filter: Option<SearchExpression>,
     },
     Insert {

@@ -270,6 +270,7 @@ fn format_copy_value(
         DataBaseDataEntry::FloatF64(v) => v.into_inner().to_string(),
         DataBaseDataEntry::String(v) => v.clone(),
         DataBaseDataEntry::Bytes(v) => format!("\\\\x{}", encode_hex(v)),
+        DataBaseDataEntry::Timestamp(v) => v.to_string(),
     };
     escape_copy_field(&rendered, delimiter)
 }
@@ -363,6 +364,14 @@ fn parse_copy_value(
             }
         }
         DataBaseDataType::Null => Ok(DataBaseDataEntry::Null),
+        DataBaseDataType::Timestamp => text
+            .parse::<i64>()
+            .map(DataBaseDataEntry::Timestamp)
+            .or_else(|_| {
+                Ok(DataBaseDataEntry::Timestamp(
+                    crate::backend::core::plan::dml::current_timestamp_micros(),
+                ))
+            }),
     }
 }
 

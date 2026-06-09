@@ -17,14 +17,10 @@ pub fn setup() -> (
     let auto_vacuum_interval_secs = config.auto_vacuum_interval_secs;
     let internal_state_manager = Arc::new(RwLock::new(InternalStateManager::new(config.clone())));
     let logger_handle = init_logger(
-        internal_state_manager
-            .read()
-            .unwrap()
-            .config
-            .log_path
-            .as_str(),
+        config.log_path.as_str(),
+        crate::backend::logger::parse_log_level(&config.log_level),
     );
-    info!("Configuration loaded: {:?}", config);
+    info!("Database starting (database={})", config.database);
     if config.database.is_empty() {
         panic!("`database` must be set in db_config.toml");
     }

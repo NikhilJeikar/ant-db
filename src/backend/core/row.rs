@@ -56,6 +56,8 @@ pub enum DataBaseDataEntry {
     String(String),
     Boolean(bool),
     Bytes(Vec<u8>),
+    /// Microseconds since Unix epoch.
+    Timestamp(i64),
 }
 
 impl DataBaseDataEntry {
@@ -81,6 +83,7 @@ impl DataBaseDataEntry {
             DataBaseDataEntry::String(_) => DataBaseDataType::String,
             DataBaseDataEntry::Boolean(_) => DataBaseDataType::Boolean,
             DataBaseDataEntry::Bytes(_) => DataBaseDataType::Bytes,
+            DataBaseDataEntry::Timestamp(_) => DataBaseDataType::Timestamp,
         }
     }
 
@@ -130,11 +133,41 @@ impl DataBaseDataEntry {
                 value.hash(&mut hasher);
                 hasher.finish()
             }
+            DataBaseDataEntry::Timestamp(value) => *value as u64,
         }
     }
 
     pub fn is_null(&self) -> bool {
         matches!(self, DataBaseDataEntry::Null)
+    }
+
+    /// Text representation sent to PostgreSQL wire-protocol clients.
+    pub fn to_wire_text(&self) -> String {
+        match self {
+            DataBaseDataEntry::Null => String::new(),
+            DataBaseDataEntry::Boolean(flag) => {
+                if *flag {
+                    "t".to_string()
+                } else {
+                    "f".to_string()
+                }
+            }
+            DataBaseDataEntry::IntegerU8(v) => v.to_string(),
+            DataBaseDataEntry::IntegerU16(v) => v.to_string(),
+            DataBaseDataEntry::IntegerU32(v) => v.to_string(),
+            DataBaseDataEntry::IntegerU64(v) => v.to_string(),
+            DataBaseDataEntry::IntegerU128(v) => v.to_string(),
+            DataBaseDataEntry::IntegerI8(v) => v.to_string(),
+            DataBaseDataEntry::IntegerI16(v) => v.to_string(),
+            DataBaseDataEntry::IntegerI32(v) => v.to_string(),
+            DataBaseDataEntry::IntegerI64(v) => v.to_string(),
+            DataBaseDataEntry::IntegerI128(v) => v.to_string(),
+            DataBaseDataEntry::FloatF32(v) => v.into_inner().to_string(),
+            DataBaseDataEntry::FloatF64(v) => v.into_inner().to_string(),
+            DataBaseDataEntry::String(v) => v.clone(),
+            DataBaseDataEntry::Bytes(v) => format!("\\x{}", v.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            DataBaseDataEntry::Timestamp(v) => v.to_string(),
+        }
     }
 }
 

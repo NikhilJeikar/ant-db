@@ -484,14 +484,11 @@ impl Table {
             .map(|(page_id, _)| page_id)
     }
 
-    fn evict_page(
+    fn flush_and_evict_page(
         &self,
         page_id: PageID,
-        row_space: &mut BTreeMap<PageID, Arc<RwLock<Page>>>,
+        page_arc: Arc<RwLock<Page>>,
     ) -> Result<(), DataBaseErrors> {
-        let Some(page_arc) = row_space.remove(&page_id) else {
-            return Ok(());
-        };
         let page = page_arc
             .read()
             .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page read lock".into()))?;
@@ -504,6 +501,17 @@ impl Table {
             evicted.insert(page_id);
         }
         Ok(())
+    }
+
+    fn evict_page(
+        &self,
+        page_id: PageID,
+        row_space: &mut BTreeMap<PageID, Arc<RwLock<Page>>>,
+    ) -> Result<(), DataBaseErrors> {
+        let Some(page_arc) = row_space.remove(&page_id) else {
+            return Ok(());
+        };
+        self.flush_and_evict_page(page_id, page_arc)
     }
 
     fn maybe_evict_pages(&self, pinned: Option<PageID>) -> Result<(), DataBaseErrors> {
@@ -529,14 +537,21 @@ impl Table {
                 return Ok(());
             };
 
-            let mut row_space = self
-                .row_space
-                .write()
-                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space write lock".into()))?;
-            if self.memory_used.load(Ordering::SeqCst) <= limit {
-                return Ok(());
-            }
-            self.evict_page(victim, &mut row_space)?;
+            let page_arc = {
+                let mut row_space = self
+                    .row_space
+                    .write()
+                    .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space write lock".into()))?;
+                if self.memory_used.load(Ordering::SeqCst) <= limit {
+                    return Ok(());
+                }
+                row_space.remove(&victim)
+            };
+
+            let Some(page_arc) = page_arc else {
+                continue;
+            };
+            self.flush_and_evict_page(victim, page_arc)?;
         }
     }
 
@@ -553,6 +568,12 @@ impl Table {
 
         let page = self.load_page_from_disk(page_id)?;
         let page_arc = Arc::new(RwLock::new(page));
+        let memory_bytes = {
+            let page = page_arc
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page read lock".into()))?;
+            Self::page_memory_bytes(&page)
+        };
         {
             let mut row_space = self
                 .row_space
@@ -562,9 +583,10 @@ impl Table {
                 self.touch_page(page_id);
                 return Ok(existing.clone());
             }
-            self.track_page_in_memory(page_id, &page_arc.read().unwrap());
             row_space.insert(page_id, page_arc.clone());
         }
+        self.memory_used.fetch_add(memory_bytes, Ordering::SeqCst);
+        self.touch_page(page_id);
         if let Ok(mut evicted) = self.evicted_pages.write() {
             evicted.remove(&page_id);
         }
@@ -1095,14 +1117,21 @@ impl Table {
     fn register_page(&self) -> Result<(PageID, Arc<RwLock<Page>>), DataBaseErrors> {
         let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
         let page = Arc::new(RwLock::new(Page::new(page_id, self.page_size)));
+        let memory_bytes = {
+            let page_guard = page
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire page read lock".into()))?;
+            Self::page_memory_bytes(&page_guard)
+        };
         {
             let mut row_space = self
                 .row_space
                 .write()
                 .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space write lock".into()))?;
-            self.track_page_in_memory(page_id, &page.read().unwrap());
             row_space.insert(page_id, page.clone());
         }
+        self.memory_used.fetch_add(memory_bytes, Ordering::SeqCst);
+        self.touch_page(page_id);
         self.maybe_evict_pages(None)?;
         Ok((page_id, page))
     }
@@ -1140,66 +1169,59 @@ impl Table {
         Ok(())
     }
 
+    /// Try to append to the current tail page without holding `row_space` write.
+    fn try_append_to_tail_page(
+        &self,
+        row_id: RowID,
+        row: &mut Row,
+        size: u64,
+    ) -> Result<Option<PageID>, DataBaseErrors> {
+        let tail = {
+            let row_space = self
+                .row_space
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space read lock".into()))?;
+            row_space
+                .iter()
+                .next_back()
+                .map(|(id, page)| (*id, page.clone()))
+        };
+
+        let Some((tail_id, tail_page)) = tail else {
+            return Ok(None);
+        };
+
+        match Self::try_append_to_page(&tail_page, row_id, row.clone(), size) {
+            Ok(()) => {
+                self.touch_page(tail_id);
+                Ok(Some(tail_id))
+            }
+            Err(returned_row) => {
+                *row = returned_row;
+                Ok(None)
+            }
+        }
+    }
+
     /// Append a row to the tail page, allocating a new page only when needed.
-    /// Concurrent inserters synchronize on individual pages; `row_space` write
-    /// locks are held only briefly during page registration.
+    /// Page write locks are never taken while holding `row_space` write.
     fn insert_row_into_page(
         &self,
         row_id: RowID,
         mut row: Row,
         size: u64,
     ) -> Result<PageID, DataBaseErrors> {
-        // Fast path: shared lock on the page map, exclusive lock on one page.
-        {
-            let row_space = self
-                .row_space
-                .read()
-                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space read lock".into()))?;
-            if let Some((tail_id, tail_page)) = row_space
-                .iter()
-                .next_back()
-                .map(|(id, page)| (*id, page.clone()))
-            {
-                match Self::try_append_to_page(&tail_page, row_id, row, size) {
-                    Ok(()) => {
-                        self.touch_page(tail_id);
-                        return Ok(tail_id);
-                    }
-                    Err(returned_row) => row = returned_row,
-                }
-            }
+        if let Some(tail_id) = self.try_append_to_tail_page(row_id, &mut row, size)? {
+            return Ok(tail_id);
         }
 
-        // Slow path: re-check under write lock, then register a page if needed.
-        let (page_id, page) = {
-            let mut row_space = self
-                .row_space
-                .write()
-                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire row_space write lock".into()))?;
+        // Retry once: another inserter may have appended or extended the tail.
+        if let Some(tail_id) = self.try_append_to_tail_page(row_id, &mut row, size)? {
+            return Ok(tail_id);
+        }
 
-            if let Some((tail_id, tail_page)) = row_space
-                .iter()
-                .next_back()
-                .map(|(id, page)| (*id, page.clone()))
-            {
-                match Self::try_append_to_page(&tail_page, row_id, row, size) {
-                    Ok(()) => {
-                        self.touch_page(tail_id);
-                        return Ok(tail_id);
-                    }
-                    Err(returned_row) => row = returned_row,
-                }
-            }
-
-            let page_id = self.next_page_id.fetch_add(1, Ordering::SeqCst);
-            let page = Arc::new(RwLock::new(Page::new(page_id, self.page_size)));
-            self.track_page_in_memory(page_id, &page.read().unwrap());
-            row_space.insert(page_id, page.clone());
-            (page_id, page)
-        };
-
+        let (page_id, page) = self.register_page()?;
         Self::force_append_to_page(&page, row_id, row, size)?;
-        self.maybe_evict_pages(None)?;
         Ok(page_id)
     }
 
@@ -1510,6 +1532,22 @@ impl Table {
         Ok(visible_columns)
     }
 
+    pub fn column_data_type(
+        &self,
+        column_id: ColumnID,
+        transaction: &Transaction,
+    ) -> Result<Option<DataBaseDataType>, DataBaseErrors> {
+        let column = self.columns.get(&column_id).ok_or_else(|| {
+            DataBaseErrors::QueryError(format!("Column {column_id} not found"))
+        })?;
+        let guard = column
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire column read lock".into()))?;
+        Ok(guard
+            .get_versioned_column(transaction)
+            .map(|version| version.data_type.clone()))
+    }
+
     fn index_lookup_candidates(
         &self,
         column_name: &str,
@@ -1555,6 +1593,93 @@ impl Table {
                 })
             })
             .collect();
+
+        if let Some(crate::backend::core::search::AggregateProjection::CountStar { output_name }) =
+            &request.aggregate
+        {
+            if !request.order_by.is_empty() {
+                return Err(DataBaseErrors::QueryError(
+                    "ORDER BY is unsupported with COUNT(*)".into(),
+                ));
+            }
+
+            let mut count = 0usize;
+            let mut count_row = |row_id: RowID,
+                                 version: &crate::backend::core::row::InternalRow|
+             -> Result<(), DataBaseErrors> {
+                let mut ctx = RowEvaluationContext::default();
+                for (column_name, column_id) in &visible_columns {
+                    let value = version
+                        .data
+                        .get(column_id)
+                        .cloned()
+                        .unwrap_or(DataBaseDataEntry::Null);
+                    ctx.values.insert(column_name.clone(), value);
+                }
+                let matches = match &request.filter {
+                    Some(filter) => filter.evaluate(&ctx)?,
+                    None => true,
+                };
+                if matches {
+                    count += 1;
+                }
+                let _ = row_id;
+                Ok(())
+            };
+
+            if let Some(candidate_row_ids) = match &request.filter {
+                Some(filter) if filter.equality_lookup().is_some() => {
+                    if let Some((column_name, value)) = filter.equality_lookup() {
+                        self.index_lookup_candidates(
+                            column_name,
+                            value,
+                            transaction,
+                            &visible_columns,
+                        )?
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            } {
+                for row_id in candidate_row_ids {
+                    let page = self.page_for_row(row_id)?;
+                    let page_guard = page.read().unwrap();
+                    if let Some(row) = page_guard.rows.get(&row_id) {
+                        if let Some(version) = row.get_versioned_row(transaction) {
+                            count_row(row_id, version)?;
+                        }
+                    }
+                }
+            } else {
+                let page_ids: BTreeSet<PageID> = self
+                    .row_locations
+                    .read()
+                    .map_err(|_| {
+                        DataBaseErrors::QueryError("Failed to acquire row_locations read lock".into())
+                    })?
+                    .values()
+                    .copied()
+                    .collect();
+
+                for page_id in page_ids {
+                    let page = self.ensure_page_resident(page_id)?;
+                    let page_guard = page.read().unwrap();
+                    for (row_id, row) in page_guard.rows.iter() {
+                        if let Some(version) = row.get_versioned_row(transaction) {
+                            count_row(*row_id, version)?;
+                        }
+                    }
+                }
+            }
+
+            let mut values = AHashMap::new();
+            values.insert(
+                output_name.clone(),
+                DataBaseDataEntry::IntegerI64(count as i64),
+            );
+            return Ok(vec![SearchResult { row_id: 0, values }]);
+        }
 
         let projection_columns: Vec<(String, ColumnID)> = match &request.projection {
             Some(projection) => projection

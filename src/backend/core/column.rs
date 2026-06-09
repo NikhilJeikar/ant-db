@@ -38,6 +38,7 @@ pub enum DataBaseDataType {
     String,
     Boolean,
     Bytes,
+    Timestamp,
 }
 
 impl DataBaseDataType {
@@ -59,6 +60,7 @@ impl DataBaseDataType {
             Self::String => "TEXT",
             Self::Boolean => "BOOLEAN",
             Self::Bytes => "BYTES",
+            Self::Timestamp => "TIMESTAMP",
         }
     }
 }

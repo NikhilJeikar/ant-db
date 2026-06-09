@@ -3,6 +3,7 @@ use crate::backend::core::table::TableID;
 use crate::backend::core::database::Database;
 use crate::backend::core::plan::physical::{AccessPath, PhysicalPlan, PhysicalSelectPlan};
 use crate::backend::core::query;
+use crate::backend::core::plan::dml::{apply_update_assignment, UpdateAssignment};
 use crate::backend::core::row::DataBaseDataEntry;
 use crate::backend::core::search::{SearchRequest, SearchResult};
 use crate::backend::core::transaction::Transaction;
@@ -80,7 +81,12 @@ fn execute_select(
 ) -> Result<ExecutionResult, DataBaseErrors> {
     let rows = query::execute_physical_select(db, plan, transaction)?;
 
-    let column_names = if let Some(projection) = &plan.request.projection {
+    let column_names = if let Some(crate::backend::core::search::AggregateProjection::CountStar {
+        output_name,
+    }) = &plan.request.aggregate
+    {
+        vec![output_name.clone()]
+    } else if let Some(projection) = &plan.request.projection {
         projection
             .iter()
             .map(|column| column.output_name.clone())
@@ -145,7 +151,7 @@ fn execute_delete(
 fn execute_update<F>(
     db: &Database,
     table_name: &str,
-    assignments: Vec<(String, DataBaseDataEntry)>,
+    assignments: Vec<(String, UpdateAssignment)>,
     filter: Option<crate::backend::core::search::SearchExpression>,
     access_path: &AccessPath,
     transaction: &Transaction,
@@ -167,11 +173,19 @@ where
         None,
     );
 
-    let table_read = table
-        .read()
-        .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
-    let visible_columns = table_read.get_visible_column_map(transaction)?;
-    let rows = table_read.search(&search_request, transaction, Some(access_path))?;
+    let visible_columns = {
+        let table_read = table
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
+        table_read.get_visible_column_map(transaction)?
+    };
+
+    let rows = {
+        let table_read = table
+            .read()
+            .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
+        table_read.search(&search_request, transaction, Some(access_path))?
+    };
 
     let mut updated_count = 0;
     for row in rows {
@@ -187,14 +201,37 @@ where
             row_data_by_id.insert(*column_id, value);
         }
 
-        for (column_name, value) in &assignments {
+        for (column_name, assignment) in &assignments {
             let column_id = visible_columns.get(column_name).ok_or_else(|| {
                 DataBaseErrors::QueryError(format!("Assignment column '{column_name}' not found"))
             })?;
-            row_data_by_id.insert(*column_id, value.clone());
+            let expected_type = {
+                let table_read = table
+                    .read()
+                    .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
+                table_read
+                    .column_data_type(*column_id, transaction)?
+                    .ok_or_else(|| {
+                        DataBaseErrors::QueryError(format!(
+                            "Assignment column '{column_name}' not found",
+                        ))
+                    })?
+            };
+            let value = apply_update_assignment(
+                assignment,
+                &row_data_by_id,
+                *column_id,
+                &expected_type,
+            )?;
+            row_data_by_id.insert(*column_id, value);
         }
 
-        table_read.update_row(row.row_id, row_data_by_id, transaction, &mut *fk_lookup)?;
+        {
+            let table_read = table
+                .read()
+                .map_err(|_| DataBaseErrors::QueryError("Failed to acquire table read lock".into()))?;
+            table_read.update_row(row.row_id, row_data_by_id, transaction, &mut *fk_lookup)?;
+        }
         updated_count += 1;
     }
 

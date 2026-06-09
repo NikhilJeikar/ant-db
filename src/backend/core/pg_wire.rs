@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ahash::AHashMap;
 use async_trait::async_trait;
@@ -162,6 +162,7 @@ fn parse_create_table_data_type(
         DataType::Numeric(_) | DataType::Decimal(_) | DataType::BigNumeric(_) | DataType::BigDecimal(_) | DataType::Dec(_) => {
             DataBaseDataType::FloatF64
         }
+        DataType::Timestamp(..) | DataType::Datetime(_) => DataBaseDataType::Timestamp,
         _ => {
             return Err(DataBaseErrors::QueryError(format!(
                 "Unsupported column type in CREATE TABLE: {data_type:?}",
@@ -379,50 +380,93 @@ pub struct PgWireHandler {
     pub db: Arc<RwLock<Database>>,
     pub active_transactions: Arc<RwLock<HashMap<SocketAddr, Transaction>>>,
     copy_sessions: Arc<RwLock<HashMap<SocketAddr, CopySession>>>,
+    /// Serializes BEGIN/COMMIT/ROLLBACK bookkeeping to avoid lock-order deadlocks.
+    txn_lifecycle: Arc<Mutex<()>>,
 }
 
 impl NoopStartupHandler for PgWireHandler {}
 
 impl PgWireHandler {
+    fn clone_state(&self) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            active_transactions: Arc::clone(&self.active_transactions),
+            copy_sessions: Arc::clone(&self.copy_sessions),
+            txn_lifecycle: Arc::clone(&self.txn_lifecycle),
+        }
+    }
+
+    fn connection_transaction_at(&self, addr: SocketAddr) -> Option<Transaction> {
+        self.active_transactions
+            .read()
+            .unwrap()
+            .get(&addr)
+            .cloned()
+    }
+
     fn connection_transaction<C>(&self, client: &C) -> Option<Transaction>
     where
         C: ClientInfo,
     {
-        let active_transactions = self.active_transactions.read().unwrap();
-        active_transactions.get(&client.socket_addr()).cloned()
+        self.connection_transaction_at(client.socket_addr())
+    }
+
+    fn create_connection_transaction_at(&self, addr: SocketAddr) -> Result<Transaction, DataBaseErrors> {
+        if self.connection_transaction_at(addr).is_some() {
+            return Err(DataBaseErrors::QueryError(
+                "Transaction already in progress".into(),
+            ));
+        }
+
+        let _guard = self.txn_lifecycle.lock().unwrap();
+        let transaction = {
+            let mut db = self.db.write().unwrap();
+            db.create_transaction()
+        };
+        self.active_transactions
+            .write()
+            .unwrap()
+            .insert(addr, transaction.clone());
+        Ok(transaction)
     }
 
     fn create_connection_transaction<C>(&self, client: &C) -> Result<Transaction, DataBaseErrors>
     where
         C: ClientInfo,
     {
-        if self.connection_transaction(client).is_some() {
-            return Err(DataBaseErrors::QueryError(
-                "Transaction already in progress".into(),
-            ));
-        }
+        self.create_connection_transaction_at(client.socket_addr())
+    }
 
-        let mut db = self.db.write().unwrap();
-        let transaction = db.create_transaction();
-        self.active_transactions
+    fn commit_connection_transaction_at(&self, addr: SocketAddr) -> Result<(), DataBaseErrors> {
+        let _guard = self.txn_lifecycle.lock().unwrap();
+        let transaction = self
+            .active_transactions
             .write()
             .unwrap()
-            .insert(client.socket_addr(), transaction.clone());
-        Ok(transaction)
+            .remove(&addr)
+            .ok_or_else(|| DataBaseErrors::QueryError("No active transaction to commit".into()))?;
+        let mut db = self.db.write().unwrap();
+        db.commit_transaction(transaction.transaction_id);
+        Ok(())
     }
 
     fn commit_connection_transaction<C>(&self, client: &C) -> Result<(), DataBaseErrors>
     where
         C: ClientInfo,
     {
+        self.commit_connection_transaction_at(client.socket_addr())
+    }
+
+    fn rollback_connection_transaction_at(&self, addr: SocketAddr) -> Result<(), DataBaseErrors> {
+        let _guard = self.txn_lifecycle.lock().unwrap();
         let transaction = self
             .active_transactions
             .write()
             .unwrap()
-            .remove(&client.socket_addr())
-            .ok_or_else(|| DataBaseErrors::QueryError("No active transaction to commit".into()))?;
+            .remove(&addr)
+            .ok_or_else(|| DataBaseErrors::QueryError("No active transaction to rollback".into()))?;
         let mut db = self.db.write().unwrap();
-        db.commit_transaction(transaction.transaction_id);
+        db.rollback_transaction(&transaction);
         Ok(())
     }
 
@@ -430,22 +474,14 @@ impl PgWireHandler {
     where
         C: ClientInfo,
     {
-        let transaction = self
-            .active_transactions
-            .write()
-            .unwrap()
-            .remove(&client.socket_addr())
-            .ok_or_else(|| DataBaseErrors::QueryError("No active transaction to rollback".into()))?;
-        let mut db = self.db.write().unwrap();
-        db.rollback_transaction(&transaction);
-        Ok(())
+        self.rollback_connection_transaction_at(client.socket_addr())
     }
 
-    fn transaction_for_query<C>(&self, client: &C) -> Result<(Transaction, bool), DataBaseErrors>
-    where
-        C: ClientInfo,
-    {
-        if let Some(transaction) = self.connection_transaction(client) {
+    fn transaction_for_query_at(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(Transaction, bool), DataBaseErrors> {
+        if let Some(transaction) = self.connection_transaction_at(addr) {
             return Ok((transaction, false));
         }
 
@@ -454,12 +490,22 @@ impl PgWireHandler {
         Ok((transaction, true))
     }
 
-    fn execute_transactional<C, F, R>(&self, client: &C, action: F) -> Result<R, DataBaseErrors>
+    fn transaction_for_query<C>(&self, client: &C) -> Result<(Transaction, bool), DataBaseErrors>
     where
         C: ClientInfo,
+    {
+        self.transaction_for_query_at(client.socket_addr())
+    }
+
+    fn execute_transactional_at<F, R>(
+        &self,
+        addr: SocketAddr,
+        action: F,
+    ) -> Result<R, DataBaseErrors>
+    where
         F: FnOnce(&Transaction) -> Result<R, DataBaseErrors>,
     {
-        let (transaction, should_commit) = self.transaction_for_query(client)?;
+        let (transaction, should_commit) = self.transaction_for_query_at(addr)?;
         let result = action(&transaction);
 
         if should_commit {
@@ -468,9 +514,60 @@ impl PgWireHandler {
                 Ok(_) => db.commit_transaction(transaction.transaction_id),
                 Err(_) => db.rollback_transaction(&transaction),
             }
+        } else if result.is_err() {
+            let _guard = self.txn_lifecycle.lock().unwrap();
+            self.active_transactions.write().unwrap().remove(&addr);
+            let mut db = self.db.write().unwrap();
+            db.rollback_transaction(&transaction);
         }
 
         result
+    }
+
+    fn execute_transactional<C, F, R>(&self, client: &C, action: F) -> Result<R, DataBaseErrors>
+    where
+        C: ClientInfo,
+        F: FnOnce(&Transaction) -> Result<R, DataBaseErrors>,
+    {
+        self.execute_transactional_at(client.socket_addr(), action)
+    }
+
+    async fn run_on_blocking_pool<F, R>(&self, task: F) -> Result<R, DataBaseErrors>
+    where
+        F: FnOnce(Self) -> Result<R, DataBaseErrors> + Send + 'static,
+        R: Send + 'static,
+    {
+        let handler = self.clone_state();
+        tokio::task::spawn_blocking(move || task(handler))
+            .await
+            .map_err(|err| DataBaseErrors::QueryError(format!("database worker failed: {err}")))?
+    }
+
+    fn run_query_pipeline_at(
+        &self,
+        addr: SocketAddr,
+        statement: Statement,
+    ) -> Result<ExecutionResult, DataBaseErrors> {
+        self.execute_transactional_at(addr, |transaction| {
+            let db_read = self.db.read().unwrap();
+            plan::plan_and_execute(&db_read, statement, transaction, |table_id, column_id, value| {
+                let db = self.db.read().unwrap();
+                db.foreign_key_value_exists(table_id, column_id, value, transaction)
+            })
+        })
+    }
+
+    async fn run_query_pipeline_async<C>(
+        &self,
+        client: &C,
+        statement: Statement,
+    ) -> Result<ExecutionResult, DataBaseErrors>
+    where
+        C: ClientInfo + Send + Sync,
+    {
+        let addr = client.socket_addr();
+        self.run_on_blocking_pool(move |handler| handler.run_query_pipeline_at(addr, statement))
+            .await
     }
 
     fn begin_copy_transaction<C>(&self, client: &C) -> Result<(Transaction, bool), DataBaseErrors>
@@ -522,23 +619,6 @@ impl PgWireHandler {
         Ok(vec![Response::Execution(Tag::new("ERROR"))])
     }
 
-    fn run_query_pipeline<C>(
-        &self,
-        client: &C,
-        statement: Statement,
-    ) -> Result<ExecutionResult, DataBaseErrors>
-    where
-        C: ClientInfo,
-    {
-        self.execute_transactional(client, |transaction| {
-            let db_read = self.db.read().unwrap();
-            plan::plan_and_execute(&db_read, statement, transaction, |table_id, column_id, value| {
-                let db = self.db.read().unwrap();
-                db.foreign_key_value_exists(table_id, column_id, value, transaction)
-            })
-        })
-    }
-
     async fn respond_planned_error<C>(
         &self,
         client: &mut C,
@@ -560,63 +640,23 @@ impl PgWireHandler {
             .await?;
         Ok(vec![Response::Execution(Tag::new("ERROR"))])
     }
-}
 
-#[async_trait]
-impl SimpleQueryHandler for PgWireHandler {
-    async fn do_query<'a, C>(
+    fn responses_contain_error(responses: &[Response]) -> bool {
+        responses.iter().any(|response| {
+            matches!(response, Response::Execution(tag) if *tag == Tag::new("ERROR"))
+        })
+    }
+
+    async fn execute_simple_statement<'a, C>(
         &self,
         client: &mut C,
-        query: &'a str,
+        statement: Statement,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let query = normalize_simple_query(query);
-        client
-            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                ErrorInfo::new(
-                    "NOTICE".to_owned(),
-                    "01000".to_owned(),
-                    format!("Query received: {}", query),
-                ),
-            )))
-            .await?;
-
-        let statements = match plan::parse_sql(&query) {
-            Ok(statements) => statements,
-            Err(err) => {
-                client
-                    .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                        ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "42601".to_owned(),
-                            err.to_string(),
-                        ),
-                    )))
-                    .await?;
-                return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-            }
-        };
-
-        let statement = match statements.into_iter().next() {
-            Some(statement) => statement,
-            None => {
-                client
-                    .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                        ErrorInfo::new(
-                            "ERROR".to_owned(),
-                            "42601".to_owned(),
-                            "Empty SQL statement".to_owned(),
-                        ),
-                    )))
-                    .await?;
-                return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
-            }
-        };
-
         match statement {
             Statement::ShowTables { filter, .. } => {
                 let field = FieldInfo::new(
@@ -1073,7 +1113,11 @@ impl SimpleQueryHandler for PgWireHandler {
                 }
             }
             Statement::StartTransaction { .. } => {
-                match self.create_connection_transaction(client) {
+                let addr = client.socket_addr();
+                match self
+                    .run_on_blocking_pool(move |handler| handler.create_connection_transaction_at(addr))
+                    .await
+                {
                     Ok(_) => return Ok(vec![Response::TransactionStart(Tag::new("BEGIN"))]),
                     Err(err) => {
                         client
@@ -1086,7 +1130,11 @@ impl SimpleQueryHandler for PgWireHandler {
                 }
             }
             Statement::Commit { .. } => {
-                match self.commit_connection_transaction(client) {
+                let addr = client.socket_addr();
+                match self
+                    .run_on_blocking_pool(move |handler| handler.commit_connection_transaction_at(addr))
+                    .await
+                {
                     Ok(_) => return Ok(vec![Response::TransactionEnd(Tag::new("COMMIT"))]),
                     Err(err) => {
                         client
@@ -1108,7 +1156,11 @@ impl SimpleQueryHandler for PgWireHandler {
                     return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
                 }
 
-                match self.rollback_connection_transaction(client) {
+                let addr = client.socket_addr();
+                match self
+                    .run_on_blocking_pool(move |handler| handler.rollback_connection_transaction_at(addr))
+                    .await
+                {
                     Ok(_) => return Ok(vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]),
                     Err(err) => {
                         client
@@ -1214,7 +1266,7 @@ impl SimpleQueryHandler for PgWireHandler {
                 }
             }
             Statement::Delete(delete) => {
-                match self.run_query_pipeline(client, Statement::Delete(delete)) {
+                match self.run_query_pipeline_async(client, Statement::Delete(delete)).await {
                     Ok(ExecutionResult::RowsAffected { tag, .. }) => {
                         return Ok(vec![Response::Execution(Tag::new(tag))]);
                     }
@@ -1227,7 +1279,7 @@ impl SimpleQueryHandler for PgWireHandler {
                 }
             }
             Statement::Insert(insert) => {
-                match self.run_query_pipeline(client, Statement::Insert(insert)) {
+                match self.run_query_pipeline_async(client, Statement::Insert(insert)).await {
                     Ok(ExecutionResult::RowsAffected { tag, .. }) => {
                         return Ok(vec![Response::Execution(Tag::new(tag))]);
                     }
@@ -1246,16 +1298,19 @@ impl SimpleQueryHandler for PgWireHandler {
                 from,
                 returning,
             } => {
-                match self.run_query_pipeline(
-                    client,
-                    Statement::Update {
-                        table,
-                        assignments,
-                        selection,
-                        from,
-                        returning,
-                    },
-                ) {
+                match self
+                    .run_query_pipeline_async(
+                        client,
+                        Statement::Update {
+                            table,
+                            assignments,
+                            selection,
+                            from,
+                            returning,
+                        },
+                    )
+                    .await
+                {
                     Ok(ExecutionResult::RowsAffected { tag, .. }) => {
                         return Ok(vec![Response::Execution(Tag::new(tag))]);
                     }
@@ -1460,7 +1515,8 @@ impl SimpleQueryHandler for PgWireHandler {
             }
             Statement::Query(query) => {
                 let (column_names, search_results) = match self
-                    .run_query_pipeline(client, Statement::Query(query))
+                    .run_query_pipeline_async(client, Statement::Query(query))
+                    .await
                 {
                     Ok(ExecutionResult::Select { column_names, rows }) => (column_names, rows),
                     Ok(_) => {
@@ -1493,7 +1549,7 @@ impl SimpleQueryHandler for PgWireHandler {
                         let value = row
                             .values
                             .get(column_name)
-                            .map(|entry| format!("{:?}", entry));
+                            .map(|entry| entry.to_wire_text());
                         encoder.encode_field(&value.as_deref())?;
                     }
                     encoder.finish()
@@ -1517,7 +1573,63 @@ impl SimpleQueryHandler for PgWireHandler {
                 return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
             }
         }
+    }
+}
 
+#[async_trait]
+impl SimpleQueryHandler for PgWireHandler {
+    async fn do_query<'a, C>(
+        &self,
+        client: &mut C,
+        query: &'a str,
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let query = normalize_simple_query(query);
+
+        let statements = match plan::parse_sql(&query) {
+            Ok(statements) => statements,
+            Err(err) => {
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                        ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "42601".to_owned(),
+                            err.to_string(),
+                        ),
+                    )))
+                    .await?;
+                return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+            }
+        };
+
+        if statements.is_empty() {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                    ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "42601".to_owned(),
+                        "Empty SQL statement".to_owned(),
+                    ),
+                )))
+                .await?;
+            return Ok(vec![Response::Execution(Tag::new("ERROR"))]);
+        }
+
+        let mut all_responses: Vec<Response<'a>> = Vec::new();
+        for statement in statements {
+            let batch = self.execute_simple_statement(client, statement).await?;
+            let failed = Self::responses_contain_error(&batch);
+            all_responses.extend(batch);
+            if failed {
+                break;
+            }
+        }
+
+        Ok(all_responses)
     }
 }
 
@@ -1655,6 +1767,7 @@ pub async fn run_pgwire_server(db: Arc<RwLock<Database>>, addr: &str) {
             db,
             active_transactions: Arc::new(RwLock::new(HashMap::new())),
             copy_sessions: Arc::new(RwLock::new(HashMap::new())),
+            txn_lifecycle: Arc::new(Mutex::new(())),
         }),
     });
 

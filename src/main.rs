@@ -3,7 +3,7 @@ use crate::backend::handler::setup;
 use tracing::{error, info};
 mod backend;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     info!("Initializing database system...");
     let (internal_state_manager, db_arc, _logger_handle) = setup();

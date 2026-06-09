@@ -1,5 +1,6 @@
 snapshot_path = "db/snapshot.db"
 log_path = "db/event-db.log"
+log_level = "off"
 database = "antdb"
 table_data_path = "db/tables"
 page_size_bytes = 8192

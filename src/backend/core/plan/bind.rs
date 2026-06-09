@@ -3,7 +3,9 @@ use sqlparser::ast::{
 };
 
 use crate::backend::core::database::Database;
-use crate::backend::core::plan::dml::{build_insert_data, normalize_identifier, parse_sql_literal};
+use crate::backend::core::plan::dml::{
+    build_insert_data, normalize_identifier, parse_update_assignment,
+};
 use crate::backend::core::plan::logical::LogicalPlan;
 use crate::backend::core::search::SearchRequest;
 use crate::backend::core::transaction::Transaction;
@@ -125,7 +127,7 @@ fn bind_update(
                 ));
             }
         };
-        let value = parse_sql_literal(&assignment.value)?;
+        let value = parse_update_assignment(&column_name, &assignment.value)?;
         bound_assignments.push((column_name, value));
     }
 
