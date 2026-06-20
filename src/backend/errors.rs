@@ -1,4 +1,3 @@
-use crate::backend::core::types::Row;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -9,13 +8,27 @@ pub enum DataBaseErrors {
     #[error("Column '{0}' not found in the table.")]
     ColumnNotFound(u64),
     #[error("Index not found for column {0}.")]
-    IndexNotFound(u64),
+    IndexNotFound(String),
+    #[error("Index already exist for column {0}.")]
+    IndexExist(String),
+    
+    //Constraint errors
+    #[error("Value cannot be nullable.")]
+    NullValue(),
+    #[error("Unique Constraint failed for {0}")]
+    UniqueConstraint(String),
+    #[error("Foreign key constraint violated on column '{0}'")]
+    ForeignKeyViolation(String),
+    #[error("CHECK constraint on column '{0}' is not enforced")]
+    CheckConstraintUnsupported(String),
+    
+
 
     // Row-related errors
     #[error("Row with ID '{0}' not found in the table.")]
     RowNotFound(u64),
-    #[error("Multiple entries for row({0:?}) same column {1}")]
-    RowColumnDuplicate(Row, u64),
+    #[error("Multiple entries for row({0}) same column {1}")]
+    RowColumnDuplicate(u64,u64),
     #[error("Data type mismatch for column {0}: expected {1}, got {2}")]
     DataTypeMismatch(u64, &'static str, &'static str),
 
@@ -33,11 +46,9 @@ pub enum DataBaseErrors {
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 
-    // WAL-related errors
-    #[error("WAL lock error.")]
-    WalLockError,
-    #[error("WAL replay error: {0}")]
-    WalReplayError(String),
+    // Query errors
+    #[error("Query error: {0}")]
+    QueryError(String),
 
     // I/O errors
     #[error("I/O error: {0}")]

@@ -1,134 +1,69 @@
-use actix_web::{App, HttpServer, web};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{error, info};
 
-use crate::backend::api;
 use crate::backend::config::{Config, InternalStateManager};
-use crate::backend::core::database::InternalDatabaseSchema;
+
 use crate::backend::logger::{LoggerHandle, init_logger};
-use crate::backend::storage::snapshot::{read_snapshot_with_context, start_snapshot_monitor};
-use crate::backend::storage::wal::{WriteAheadLogManager, replay_wal};
+use crate::backend::core::database::Database;
+
 
 pub fn setup() -> (
     Arc<RwLock<InternalStateManager>>,
-    Arc<Mutex<WriteAheadLogManager>>,
-    Arc<RwLock<InternalDatabaseSchema>>,
-    Arc<std::sync::atomic::AtomicBool>,
+    Arc<RwLock<Database>>,
     LoggerHandle,
 ) {
     let config = Config::from_file("db_config.toml");
+    let auto_vacuum_interval_secs = config.auto_vacuum_interval_secs;
     let internal_state_manager = Arc::new(RwLock::new(InternalStateManager::new(config.clone())));
-    let wal_manager = Arc::new(Mutex::new(WriteAheadLogManager::new(
-        internal_state_manager.read().unwrap().config.clone(),
-    )));
     let logger_handle = init_logger(
-        internal_state_manager
-            .read()
-            .unwrap()
-            .config
-            .log_path
-            .as_str(),
+        config.log_path.as_str(),
+        crate::backend::logger::parse_log_level(&config.log_level),
     );
-    info!("Configuration loaded: {:?}", config);
-    let mut db = if internal_state_manager
-        .read()
-        .unwrap()
-        .config
-        .snapshot_path
-        .is_empty()
-    {
-        info!("No snapshot path provided, starting with empty database");
-        InternalDatabaseSchema::new(internal_state_manager.clone(), wal_manager.clone())
-    } else {
-        info!(
-            "Reading snapshot from {}",
-            internal_state_manager.read().unwrap().config.snapshot_path
-        );
-        match read_snapshot_with_context(
-            internal_state_manager
-                .read()
-                .unwrap()
-                .config
-                .snapshot_path
-                .as_str(),
-            internal_state_manager.clone(),
-            wal_manager.clone(),
-        ) {
-            Ok(db) => {
-                info!("Snapshot loaded successfully");
-                db
-            }
-            Err(e) => {
-                error!(
-                    "Failed to read snapshot: {}, starting with empty database",
-                    e
-                );
-                InternalDatabaseSchema::new(internal_state_manager.clone(), wal_manager.clone())
-            }
+    info!("Database starting (database={})", config.database);
+    if config.database.is_empty() {
+        panic!("`database` must be set in db_config.toml");
+    }
+    let snapshot_path = config.snapshot_path.clone();
+    let database_name = config.database.clone();
+    let db = match Database::load_from_snapshot(
+        &snapshot_path,
+        &database_name,
+        internal_state_manager.clone(),
+    ) {
+        Ok(Some(db)) => {
+            info!("Loaded database from snapshot at {snapshot_path}");
+            db
+        }
+        Ok(None) => {
+            info!("No snapshot found at {snapshot_path}, starting with empty database");
+            let mut db = Database::new(database_name, internal_state_manager.clone());
+            db.bind_tables();
+            db
+        }
+        Err(err) => {
+            panic!("Failed to load database snapshot from {snapshot_path}: {err}");
         }
     };
-    internal_state_manager.write().unwrap().is_wal_replaying = true;
+    let db = Arc::new(RwLock::new(db));
 
-    match replay_wal(
-        &mut db,
-        internal_state_manager
-            .read()
-            .unwrap()
-            .config
-            .wal_path
-            .as_str(),
-    ) {
-        Ok(_) => {
-            info!("WAL replay completed successfully");
-        }
-        Err(e) => {
-            error!("Failed to replay WAL: {}", e);
-        }
+    if auto_vacuum_interval_secs > 0 {
+        let db_for_vacuum = db.clone();
+        let snapshot_path = snapshot_path.clone();
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(auto_vacuum_interval_secs.max(1));
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Ok(database) = db_for_vacuum.read() {
+                    database.auto_vacuum();
+                    if let Err(err) = database.save_snapshot(&snapshot_path) {
+                        error!("Failed to save database snapshot: {err}");
+                    }
+                }
+            }
+        });
     }
 
-    internal_state_manager.write().unwrap().is_wal_replaying = false;
-    db.wal_manager = wal_manager.clone();
-
-    // Wrap database in Arc<RwLock<>> for thread-safe sharing
-    let db_arc = Arc::new(RwLock::new(db));
-
-    // Start the snapshot monitor thread
-    let snapshot_monitor_shutdown = start_snapshot_monitor(
-        wal_manager.clone(),
-        db_arc.clone(),
-        config.wal_sync_interval,
-    );
-
-    info!("Snapshot monitor started with 5 second check interval");
-
-    (
-        internal_state_manager,
-        wal_manager,
-        db_arc,
-        snapshot_monitor_shutdown,
-        logger_handle,
-    )
+    (internal_state_manager, db, logger_handle)
 }
 
-/// Start the HTTP API server
-/// This function starts the Actix-web server on the specified address and port
-pub async fn start_api_server(
-    db: Arc<RwLock<InternalDatabaseSchema>>,
-    host: &str,
-    port: u16,
-) -> std::io::Result<()> {
-    let address = format!("{}:{}", host, port);
-    info!("Starting HTTP API server on {}", address);
-
-    let address_clone = address.clone();
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(db.clone()))
-            .app_data(web::JsonConfig::default().limit(20_000_000_000))
-            .configure(api::configure_routes)
-    })
-    .bind(&address_clone)?
-    .run()
-    .await
-}

@@ -1,788 +1,1005 @@
-use crate::backend::config::InternalStateManager;
-use crate::backend::core::search::{Projection, SearchCriteria, SortBy};
-use crate::backend::core::table::{TableManager, TableWriteAheadLog};
-use crate::backend::core::types::{ColumnId, Constraint, DataType, Index, RowId, TableId};
-use crate::backend::core::types::{InternalTableSchema, Row, TableSchema};
-use crate::backend::errors::DataBaseErrors;
-use crate::backend::storage::wal::{DataBaseOperation, WriteAheadLogBase, WriteAheadLogManager};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, RwLock};
-use tracing::{debug, error, info};
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use tracing::error;
+
+use crate::backend::config::InternalStateManager;
+use crate::backend::core::table::{Table, TableID};
+use crate::backend::core::transaction::{Transaction, TransactionSnapshot};
+use crate::backend::errors::DataBaseErrors;
 
 fn serialize_tables<S>(
-    tables: &BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>,
+    tables: &BTreeMap<String, Arc<RwLock<Table>>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    let export: BTreeMap<TableId, InternalTableSchema> = tables
-        .iter()
-        .filter_map(|(k, v)| match v.read() {
-            Ok(guard) => Some((*k, guard.clone())),
+    use serde::ser::SerializeMap;
+
+    let mut map = serializer.serialize_map(Some(tables.len()))?;
+    for (name, table) in tables.iter() {
+        match table.read() {
+            Ok(guard) => {
+                map.serialize_entry(name, &*guard)?;
+            }
             Err(e) => {
                 error!(
                     "Failed to acquire read lock on table {} during serialization: {}",
-                    k, e
+                    name, e
                 );
-                None
             }
-        })
-        .collect();
-    export.serialize(serializer)
+        }
+    }
+    map.end()
 }
 
 fn deserialize_tables<'de, D>(
     deserializer: D,
-) -> Result<BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>, D::Error>
+) -> Result<BTreeMap<String, Arc<RwLock<Table>>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let intermediate = BTreeMap::<TableId, InternalTableSchema>::deserialize(deserializer)?;
+    let intermediate = BTreeMap::<String, Table>::deserialize(deserializer)?;
     Ok(intermediate
         .into_iter()
         .map(|(k, v)| (k, Arc::new(RwLock::new(v))))
         .collect())
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct InternalDatabaseSchema {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Database {
+    pub name: String,
     #[serde(
         serialize_with = "serialize_tables",
         deserialize_with = "deserialize_tables"
     )]
-    pub tables: BTreeMap<TableId, Arc<RwLock<InternalTableSchema>>>,
-    pub tables_index: BTreeMap<String, TableId>,
-    next_table_id: TableId,
+    pub tables: BTreeMap<String, Arc<RwLock<Table>>>,
+    pub next_table_id: AtomicU64,
     #[serde(skip)]
     pub internal_state_manager: Arc<RwLock<InternalStateManager>>,
     #[serde(skip)]
-    pub wal_manager: Arc<Mutex<WriteAheadLogManager>>,
+    pub transaction_snapshot: Arc<RwLock<TransactionSnapshot>>,
+    pub next_transaction_id: AtomicU64,
 }
 
-pub trait DataBaseManager {
-    fn create_table(&mut self, table_name: String) -> Result<TableId, DataBaseErrors>;
-    fn drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors>;
-
-    fn get_table_id(&self, table_name: String) -> Result<TableId, DataBaseErrors>;
-    fn get_table_schema(&self, table_id: TableId) -> Result<TableSchema, DataBaseErrors>;
-    fn get_table_size(&self, table_id: TableId) -> Result<usize, DataBaseErrors>;
-
-    fn list_tables(&self) -> Vec<String>;
-
-    fn create_column(
-        &self,
-        table_id: TableId,
-        column_name: String,
-        data_type: DataType,
-        constraints: Vec<Constraint>,
-    ) -> Result<ColumnId, DataBaseErrors>;
-    fn drop_column(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
-    fn create_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
-    fn drop_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors>;
-
-    fn insert_rows(&self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors>;
-    fn delete_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors>;
-    fn update_rows(
-        &self,
-        table_id: TableId,
-        row_ids: Vec<RowId>,
-        new_values: Row,
-    ) -> Result<(), DataBaseErrors>;
-    fn get_rows(&self, table_id: TableId, row_id: Vec<RowId>) -> Result<Vec<Row>, DataBaseErrors>;
-    fn search_rows(
-        &self,
-        table_id: TableId,
-        criteria: Vec<SearchCriteria>,
-        projection: Option<Projection>,
-        sort_by: Option<SortBy>,
-    ) -> Result<Vec<Row>, DataBaseErrors>;
-}
-
-pub trait DataBaseWriteAheadLog: WriteAheadLogBase {
-    fn wal_create_table(&mut self, table_id: TableId, name: String) -> Result<(), DataBaseErrors>;
-    fn wal_drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors>;
-    fn wal_create_column(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-        column_name: String,
-        data_type: DataType,
-        constraints: Vec<Constraint>,
-        index: Option<Index>,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_column(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_create_index(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-        index: Index,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_drop_index(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_insert_rows(
-        &mut self,
-        table_id: TableId,
-        rows: Vec<(RowId, Row)>,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_delete_rows(
-        &mut self,
-        table_id: TableId,
-        row_ids: Vec<RowId>,
-    ) -> Result<(), DataBaseErrors>;
-    fn wal_update_rows(
-        &mut self,
-        table_id: TableId,
-        row_ids: Vec<RowId>,
-        row: Row,
-    ) -> Result<(), DataBaseErrors>;
-}
-
-impl WriteAheadLogBase for InternalDatabaseSchema {
-    fn log_operation(&mut self, operation: DataBaseOperation) -> Result<(), DataBaseErrors> {
-        match self.wal_manager.lock() {
-            Ok(mut wal) => {
-                if !self.internal_state_manager.read().unwrap().is_wal_replaying {
-                    debug!("WAL lock acquired. Logging operation: {:?}", operation);
-                    wal.append(&operation);
-                    info!("Operation logged to WAL successfully");
-                } else {
-                    debug!(
-                        "Skipping WAL log during replay for operation: {:?}",
-                        operation
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to acquire WAL lock: {}", e);
-                Err(DataBaseErrors::WalLockError)
-            }
-        }
-    }
-}
-impl InternalDatabaseSchema {
-    pub fn new(
-        internal_state_manager: Arc<RwLock<InternalStateManager>>,
-        wal_manager: Arc<Mutex<WriteAheadLogManager>>,
-    ) -> Self {
-        InternalDatabaseSchema {
+impl Database {
+    pub fn new(name: String, internal_state_manager: Arc<RwLock<InternalStateManager>>) -> Self {
+        Database {
+            name,
             tables: BTreeMap::new(),
-            tables_index: BTreeMap::new(),
-            next_table_id: 0,
+            next_table_id: AtomicU64::new(0),
             internal_state_manager,
-            wal_manager: wal_manager,
+            transaction_snapshot: Arc::new(RwLock::new(TransactionSnapshot::default())),
+            next_transaction_id: AtomicU64::new(1),
         }
     }
 
-    pub fn inject_contexts(
-        &mut self,
-        internal_state_manager: Arc<RwLock<InternalStateManager>>,
-        wal_manager: Arc<Mutex<WriteAheadLogManager>>,
-    ) {
-        self.internal_state_manager = internal_state_manager;
-        self.wal_manager = wal_manager;
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
-        // Also inject into all tables
-        for table in self.tables.values_mut() {
-            match table.write() {
-                Ok(mut guard) => {
-                    guard.inject_contexts(
-                        self.internal_state_manager.clone(),
-                        self.wal_manager.clone(),
+    pub fn bind_tables(&mut self) {
+        for table in self.tables.values() {
+            if let Ok(mut table) = table.write() {
+                table.bind_page_store(&self.name, self.internal_state_manager.clone());
+            }
+        }
+    }
+
+    /// Restore database state from a snapshot file, if one exists.
+    pub fn load_from_snapshot(
+        path: &str,
+        expected_name: &str,
+        internal_state_manager: Arc<RwLock<InternalStateManager>>,
+    ) -> Result<Option<Self>, DataBaseErrors> {
+        if !Path::new(path).exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let mut db: Database = bincode::deserialize(&bytes)
+            .map_err(|e| DataBaseErrors::DeserializationError(e.to_string()))?;
+        if db.name != expected_name {
+            return Err(DataBaseErrors::QueryError(format!(
+                "Snapshot database name '{}' does not match configured database '{}'",
+                db.name, expected_name
+            )));
+        }
+        db.internal_state_manager = internal_state_manager;
+        let last_committed = db
+            .next_transaction_id
+            .load(Ordering::SeqCst)
+            .saturating_sub(1);
+        db.transaction_snapshot = Arc::new(RwLock::new(TransactionSnapshot {
+            smallest_active_transaction_id: last_committed,
+            last_possible_transaction_id: last_committed,
+            active_transaction: HashSet::new(),
+        }));
+        db.bind_tables();
+        Ok(Some(db))
+    }
+
+    /// Persist the full database metadata and in-memory state to disk.
+    pub fn save_snapshot(&self, path: &str) -> Result<(), DataBaseErrors> {
+        for table in self.tables.values() {
+            if let Ok(table) = table.read() {
+                table.flush_all_pages()?;
+            }
+        }
+        let bytes = bincode::serialize(self)
+            .map_err(|e| DataBaseErrors::SerializationError(e.to_string()))?;
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+            }
+        }
+        let tmp_path = Path::new(path).with_extension("tmp");
+        fs::write(&tmp_path, bytes).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        fs::rename(&tmp_path, path).map_err(|e| DataBaseErrors::IOError(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn create_table(&mut self, table_name: String) -> Result<TableID, DataBaseErrors> {
+        if self.tables.get(&table_name).is_none() {
+            let table_id = self.next_table_id.fetch_add(1, Ordering::SeqCst);
+            self.tables.insert(
+                table_name.clone(),
+                Arc::new(RwLock::new(Table::new(
+                    table_id,
+                    self.name.clone(),
+                    table_name.clone(),
+                    self.internal_state_manager.clone(),
+                ))),
+            );
+            return Ok(table_id);
+        }
+        Err(DataBaseErrors::TableAlreadyExists(table_name.clone()))
+    }
+
+    pub fn drop_table(&mut self, table_name: String) {
+        self.tables.remove(&table_name);
+    }
+
+    pub fn search(
+        &self,
+        request: &crate::backend::core::search::SearchRequest,
+        transaction: &Transaction,
+    ) -> Result<Vec<crate::backend::core::search::SearchResult>, DataBaseErrors> {
+        crate::backend::core::query::execute_search(self, request, transaction)
+    }
+
+    pub fn foreign_key_value_exists(
+        &self,
+        refered_table_id: TableID,
+        refered_column_id: crate::backend::core::column::ColumnID,
+        value: &crate::backend::core::row::DataBaseDataEntry,
+        transaction: &Transaction,
+    ) -> Result<bool, DataBaseErrors> {
+        if value.is_null() {
+            return Ok(true);
+        }
+
+        for table in self.tables.values() {
+            let table_guard = table.read().map_err(|_| {
+                DataBaseErrors::QueryError("Failed to acquire table read lock".into())
+            })?;
+            if table_guard.table_id() != refered_table_id {
+                continue;
+            }
+            return table_guard.referenced_value_exists(refered_column_id, value, transaction);
+        }
+
+        Ok(false)
+    }
+
+    pub fn get_table(&self, table_name: String) -> Option<Arc<RwLock<Table>>> {
+        if let Some(table) = self.tables.get(&table_name) {
+            return Some(table.clone());
+        }
+
+        let requested_name = table_name.to_ascii_lowercase();
+        self.tables
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == requested_name)
+            .map(|(_, table)| table.clone())
+    }
+
+    pub fn create_transaction(&mut self) -> Transaction {
+        let transaction_id = self.next_transaction_id.fetch_add(1, Ordering::SeqCst);
+        self.transaction_snapshot
+            .write()
+            .unwrap()
+            .active_transaction
+            .insert(transaction_id);
+        Transaction {
+            transaction_id,
+            snapshot: self.transaction_snapshot.clone(),
+        }
+    }
+
+    pub fn commit_transaction(&mut self, transaction_id: u64) {
+        self.transaction_snapshot
+            .write()
+            .unwrap()
+            .active_transaction
+            .remove(&transaction_id);
+        self.transaction_snapshot
+            .write()
+            .unwrap()
+            .last_possible_transaction_id = transaction_id;
+        if self
+            .transaction_snapshot
+            .read()
+            .unwrap()
+            .active_transaction
+            .is_empty()
+        {
+            self.transaction_snapshot
+                .write()
+                .unwrap()
+                .smallest_active_transaction_id = transaction_id;
+        } else {
+            let smallest_active = self
+                .transaction_snapshot
+                .read()
+                .unwrap()
+                .active_transaction
+                .iter()
+                .min()
+                .copied()
+                .unwrap_or(transaction_id);
+            self.transaction_snapshot
+                .write()
+                .unwrap()
+                .smallest_active_transaction_id = smallest_active;
+        }
+    }
+
+    pub fn rollback_transaction(&mut self, transaction: &Transaction) {
+        self.transaction_snapshot
+            .write()
+            .unwrap()
+            .active_transaction
+            .remove(&transaction.transaction_id);
+
+        for table in self.tables.values() {
+            table.write().unwrap().rollback_transaction(transaction);
+        }
+
+        let smallest_active = {
+            let snapshot = self.transaction_snapshot.read().unwrap();
+            if snapshot.active_transaction.is_empty() {
+                snapshot.last_possible_transaction_id
+            } else {
+                snapshot.active_transaction.iter().min().copied().unwrap_or_else(|| {
+                    snapshot.last_possible_transaction_id
+                })
+            }
+        };
+        self.transaction_snapshot
+            .write()
+            .unwrap()
+            .smallest_active_transaction_id = smallest_active;
+    }
+
+    pub fn remove_stray_tables(&self) {
+        let oldest_active = self
+            .transaction_snapshot
+            .read()
+            .unwrap()
+            .smallest_active_transaction_id;
+        for (_, table) in self.tables.iter() {
+            table.write().unwrap().prune(oldest_active);
+        }
+    }
+
+    pub fn auto_vacuum(&self) {
+        self.remove_stray_tables();
+        for table in self.tables.values() {
+            if let Ok(table) = table.read() {
+                if let Err(err) = table.flush_all_pages() {
+                    error!(
+                        "Failed to flush table '{}' during auto vacuum: {err}",
+                        table.name()
                     );
                 }
-                Err(e) => error!(
-                    "Failed to acquire write lock on table during context injection: {}",
-                    e
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, RwLock};
+
+    use ahash::AHashMap;
+
+    use crate::backend::config::{Config, InternalStateManager};
+    use crate::backend::core::column::DataBaseDataType;
+    use crate::backend::core::row::DataBaseDataEntry;
+
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    use super::Database;
+    use crate::backend::core::page_store::PageStore;
+
+    #[test]
+    fn dirty_pages_are_written_on_flush() {
+        let dir = std::env::temp_dir().join(format!("ant-db-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        table
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let mut data = AHashMap::new();
+        data.insert(0, DataBaseDataEntry::IntegerU64(42));
+        table
+            .read()
+            .unwrap()
+            .insert_row(data, &txn, |_, _, _| Ok(true))
+            .unwrap();
+        db.commit_transaction(txn.transaction_id);
+        table
+            .read()
+            .unwrap()
+            .flush_all_pages()
+            .expect("flush should write dirty pages to disk");
+
+        let expected = dir.join("testdb-users");
+        assert!(
+            expected.exists(),
+            "expected table page file at {}",
+            expected.display()
+        );
+        assert!(expected.metadata().unwrap().len() > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_restores_tables() {
+        let dir = std::env::temp_dir().join(format!("ant-db-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let snapshot_path = dir.join("snapshot.db");
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+        config.snapshot_path = snapshot_path.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config.clone())));
+        let mut db = Database::new("testdb".to_string(), ism.clone());
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        table
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let mut data = AHashMap::new();
+        data.insert(0, DataBaseDataEntry::IntegerU64(42));
+        table
+            .read()
+            .unwrap()
+            .insert_row(data, &txn, |_, _, _| Ok(true))
+            .unwrap();
+        db.commit_transaction(txn.transaction_id);
+
+        db.save_snapshot(&snapshot_path.to_string_lossy()).unwrap();
+
+        let page_file = PathBuf::from(&config.table_data_path).join("testdb-users");
+        assert!(page_file.exists(), "table page file should exist after snapshot save");
+        let page_store = PageStore::new(page_file);
+        let page_ids = page_store.list_page_ids().unwrap();
+        assert!(!page_ids.is_empty(), "table page file should contain flushed pages");
+        let flushed_page = page_store
+            .read_page(page_ids[0])
+            .unwrap()
+            .expect("first flushed page should be readable");
+        assert!(
+            flushed_page.has_rows(),
+            "flushed page should contain row data"
+        );
+
+        let snapshot_bytes = std::fs::read(&snapshot_path).unwrap();
+        assert!(
+            snapshot_bytes.len() < 4096,
+            "metadata-only snapshot should stay small, got {} bytes",
+            snapshot_bytes.len()
+        );
+
+        let mut loaded = Database::load_from_snapshot(
+            &snapshot_path.to_string_lossy(),
+            "testdb",
+            ism,
+        )
+        .unwrap()
+        .expect("snapshot should load");
+
+        assert!(loaded.get_table("users".to_string()).is_some());
+        assert_eq!(loaded.tables.len(), 1);
+        assert_eq!(
+            loaded.next_transaction_id.load(Ordering::SeqCst),
+            2,
+            "snapshot must preserve next transaction id"
+        );
+
+        let loaded_table = loaded.get_table("users".to_string()).unwrap();
+        assert_eq!(
+            loaded_table.read().unwrap().row_location_count(),
+            1,
+            "row locations should be rebuilt from page file"
+        );
+
+        let verify_txn = loaded.create_transaction();
+        let results = loaded_table
+            .read()
+            .unwrap()
+            .search(
+                &crate::backend::core::search::SearchRequest::single_table(
+                    "users".to_string(),
+                    Some(vec!["id".to_string()]),
+                    None,
+                    vec![],
+                    None,
+                    None,
                 ),
-            }
-        }
-    }
-
-    fn insert_table(&mut self, table_id: TableId, table_schema: InternalTableSchema) {
-        self.tables_index
-            .insert(table_schema.name.clone(), table_id);
-        self.tables
-            .insert(table_id, Arc::new(RwLock::new(table_schema)));
-    }
-
-    fn remove_table(&mut self, table_id: TableId) {
-        self.tables_index
-            .retain(|_key, &mut value| value != table_id);
-        self.tables.remove(&table_id);
-    }
-}
-
-impl DataBaseWriteAheadLog for InternalDatabaseSchema {
-    fn wal_create_table(
-        &mut self,
-        table_id: TableId,
-        table_name: String,
-    ) -> Result<(), DataBaseErrors> {
-        if self.tables_index.iter().any(|t| *t.0 == table_name) {
-            return Err(DataBaseErrors::TableAlreadyExists(table_name));
-        }
-        self.insert_table(
-            table_id,
-            InternalTableSchema::new(
-                table_id,
-                table_name,
-                self.internal_state_manager.clone(),
-                self.wal_manager.clone(),
-            ),
+                &verify_txn,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].values.get("id"),
+            Some(&DataBaseDataEntry::IntegerU64(42))
         );
-        Ok(())
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn wal_drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors> {
-        self.drop_table(table_id)
-    }
+    #[test]
+    fn delete_removes_unique_index_entry() {
+        use crate::backend::core::column::Constraint;
 
-    fn wal_create_column(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-        column_name: String,
-        data_type: DataType,
-        constraints: Vec<Constraint>,
-        index: Option<Index>,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_create_column(
-                column_id,
-                column_name,
-                data_type,
+        let dir = std::env::temp_dir().join(format!("ant-db-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        let mut constraints = BTreeSet::new();
+        constraints.insert(Constraint::Unique);
+        let email_col = table
+            .write()
+            .unwrap()
+            .create_column(
+                "email".to_string(),
+                DataBaseDataType::String,
                 constraints,
-                index,
+                &txn,
+            )
+            .unwrap();
+
+        let mut data = AHashMap::new();
+        data.insert(email_col, DataBaseDataEntry::String("a@b.c".to_string()));
+        let row_id = table
+            .read()
+            .unwrap()
+            .insert_row(data, &txn, |_, _, _| Ok(true))
+            .unwrap();
+        db.commit_transaction(txn.transaction_id);
+
+        let delete_txn = db.create_transaction();
+        table
+            .read()
+            .unwrap()
+            .delete_row(row_id, &delete_txn)
+            .unwrap();
+        db.commit_transaction(delete_txn.transaction_id);
+
+        let insert_txn = db.create_transaction();
+        let mut data = AHashMap::new();
+        data.insert(email_col, DataBaseDataEntry::String("a@b.c".to_string()));
+        table
+            .read()
+            .unwrap()
+            .insert_row(data, &insert_txn, |_, _, _| Ok(true))
+            .expect("reinsert after delete should not hit stale unique index entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rolled_back_delete_preserves_unique_index_entry() {
+        use crate::backend::core::column::Constraint;
+
+        let dir = std::env::temp_dir().join(format!("ant-db-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        let mut constraints = BTreeSet::new();
+        constraints.insert(Constraint::Unique);
+        let email_col = table
+            .write()
+            .unwrap()
+            .create_column(
+                "email".to_string(),
+                DataBaseDataType::String,
+                constraints,
+                &txn,
+            )
+            .unwrap();
+
+        let mut data = AHashMap::new();
+        data.insert(email_col, DataBaseDataEntry::String("a@b.c".to_string()));
+        let row_id = table
+            .read()
+            .unwrap()
+            .insert_row(data, &txn, |_, _, _| Ok(true))
+            .unwrap();
+        db.commit_transaction(txn.transaction_id);
+
+        let delete_txn = db.create_transaction();
+        table
+            .read()
+            .unwrap()
+            .delete_row(row_id, &delete_txn)
+            .unwrap();
+        db.rollback_transaction(&delete_txn);
+
+        let insert_txn = db.create_transaction();
+        let mut data = AHashMap::new();
+        data.insert(email_col, DataBaseDataEntry::String("a@b.c".to_string()));
+        let err = table
+            .read()
+            .unwrap()
+            .insert_row(data, &insert_txn, |_, _, _| Ok(true))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::backend::errors::DataBaseErrors::UniqueConstraint(_)),
+            "rolled back delete should leave the unique index intact, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_column_returns_error_for_missing_column() {
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(Config::default())));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        let err = table
+            .write()
+            .unwrap()
+            .drop_column(99, &txn)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::backend::errors::DataBaseErrors::ColumnNotFound(99)),
+            "expected ColumnNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn foreign_key_enforces_referential_integrity() {
+        use crate::backend::core::column::Constraint;
+
+        let dir = std::env::temp_dir().join(format!("ant-db-fk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        let users_table_id = db.create_table("users".to_string()).unwrap();
+        let orders_table_id = db.create_table("orders".to_string()).unwrap();
+        assert_ne!(users_table_id, orders_table_id);
+
+        let txn = db.create_transaction();
+        let users = db.get_table("users".to_string()).unwrap();
+        let orders = db.get_table("orders".to_string()).unwrap();
+
+        let user_id_col = users
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let mut order_constraints = BTreeSet::new();
+        order_constraints.insert(Constraint::ForeignKey {
+            refered_table_id: users_table_id,
+            refered_column_id: user_id_col,
+        });
+        let order_user_col = orders
+            .write()
+            .unwrap()
+            .create_column(
+                "user_id".to_string(),
+                DataBaseDataType::IntegerU64,
+                order_constraints,
+                &txn,
+            )
+            .unwrap();
+
+        let mut user_row = AHashMap::new();
+        user_row.insert(user_id_col, DataBaseDataEntry::IntegerU64(1));
+        users
+            .read()
+            .unwrap()
+            .insert_row(user_row, &txn, |table_id, column_id, value| {
+                db.foreign_key_value_exists(table_id, column_id, value, &txn)
+            })
+            .unwrap();
+
+        let mut valid_order = AHashMap::new();
+        valid_order.insert(order_user_col, DataBaseDataEntry::IntegerU64(1));
+        orders
+            .read()
+            .unwrap()
+            .insert_row(valid_order, &txn, |table_id, column_id, value| {
+                db.foreign_key_value_exists(table_id, column_id, value, &txn)
+            })
+            .unwrap();
+
+        let mut invalid_order = AHashMap::new();
+        invalid_order.insert(order_user_col, DataBaseDataEntry::IntegerU64(99));
+        let err = orders
+            .read()
+            .unwrap()
+            .insert_row(invalid_order, &txn, |table_id, column_id, value| {
+                db.foreign_key_value_exists(table_id, column_id, value, &txn)
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::backend::errors::DataBaseErrors::ForeignKeyViolation(_)),
+            "expected ForeignKeyViolation, got {err:?}"
+        );
+
+        let mut null_order = AHashMap::new();
+        null_order.insert(order_user_col, DataBaseDataEntry::Null);
+        orders
+            .read()
+            .unwrap()
+            .insert_row(null_order, &txn, |table_id, column_id, value| {
+                db.foreign_key_value_exists(table_id, column_id, value, &txn)
+            })
+            .expect("nullable foreign keys should accept NULL");
+
+        db.commit_transaction(txn.transaction_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_key_works_without_referenced_index() {
+        use crate::backend::core::column::Constraint;
+
+        let dir = std::env::temp_dir().join(format!("ant-db-fk-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        let users_table_id = db.create_table("users".to_string()).unwrap();
+        db.create_table("orders".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let users = db.get_table("users".to_string()).unwrap();
+        let orders = db.get_table("orders".to_string()).unwrap();
+
+        // No PRIMARY KEY / UNIQUE: FK lookup must fall back to a full scan.
+        let user_id_col = users
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let mut order_constraints = BTreeSet::new();
+        order_constraints.insert(Constraint::ForeignKey {
+            refered_table_id: users_table_id,
+            refered_column_id: user_id_col,
+        });
+        let order_user_col = orders
+            .write()
+            .unwrap()
+            .create_column(
+                "user_id".to_string(),
+                DataBaseDataType::IntegerU64,
+                order_constraints,
+                &txn,
+            )
+            .unwrap();
+
+        let mut user_row = AHashMap::new();
+        user_row.insert(user_id_col, DataBaseDataEntry::IntegerU64(7));
+        users
+            .read()
+            .unwrap()
+            .insert_row(user_row, &txn, |table_id, column_id, value| {
+                db.foreign_key_value_exists(table_id, column_id, value, &txn)
+            })
+            .unwrap();
+
+        let mut order_row = AHashMap::new();
+        order_row.insert(order_user_col, DataBaseDataEntry::IntegerU64(7));
+        orders
+            .read()
+            .unwrap()
+            .insert_row(order_row, &txn, |table_id, column_id, value| {
+                db.foreign_key_value_exists(table_id, column_id, value, &txn)
+            })
+            .expect("FK should resolve via table scan when reference column is not indexed");
+
+        db.commit_transaction(txn.transaction_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_constraint_rejects_non_null_values() {
+        use crate::backend::core::column::Constraint;
+
+        let dir = std::env::temp_dir().join(format!("ant-db-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("scores".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let scores = db.get_table("scores".to_string()).unwrap();
+        let mut constraints = BTreeSet::new();
+        constraints.insert(Constraint::Check);
+        let score_col = scores
+            .write()
+            .unwrap()
+            .create_column(
+                "value".to_string(),
+                DataBaseDataType::IntegerU64,
+                constraints,
+                &txn,
+            )
+            .unwrap();
+
+        let mut null_row = AHashMap::new();
+        null_row.insert(score_col, DataBaseDataEntry::Null);
+        scores
+            .read()
+            .unwrap()
+            .insert_row(null_row, &txn, |_, _, _| Ok(true))
+            .expect("NULL should bypass unsupported CHECK enforcement");
+
+        let mut row = AHashMap::new();
+        row.insert(score_col, DataBaseDataEntry::IntegerU64(1));
+        let err = scores
+            .read()
+            .unwrap()
+            .insert_row(row, &txn, |_, _, _| Ok(true))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::backend::errors::DataBaseErrors::CheckConstraintUnsupported(_)
             ),
-        }
-    }
-
-    fn wal_drop_column(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_drop_column(column_id),
-        }
-    }
-
-    fn wal_create_index(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-        index: Index,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_create_index(column_id, index),
-        }
-    }
-
-    fn wal_drop_index(
-        &mut self,
-        table_id: TableId,
-        column_id: ColumnId,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_drop_index(column_id),
-        }
-    }
-
-    fn wal_insert_rows(
-        &mut self,
-        table_id: TableId,
-        rows: Vec<(RowId, Row)>,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_insert_rows(rows),
-        }
-    }
-
-    fn wal_delete_rows(
-        &mut self,
-        table_id: TableId,
-        row_ids: Vec<RowId>,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_delete_rows(row_ids),
-        }
-    }
-
-    fn wal_update_rows(
-        &mut self,
-        table_id: TableId,
-        row_ids: Vec<RowId>,
-        row: Row,
-    ) -> Result<(), DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => i.write().unwrap().wal_update_rows(row_ids, row),
-        }
-    }
-}
-
-impl DataBaseManager for InternalDatabaseSchema {
-    fn create_table(&mut self, table_name: String) -> Result<TableId, DataBaseErrors> {
-        info!("Creating table '{}'", table_name);
-        if self.tables_index.iter().any(|t| *t.0 == table_name) {
-            error!("Table '{}' already exists", table_name);
-            return Err(DataBaseErrors::TableAlreadyExists(table_name));
-        }
-
-        let table_id = self.next_table_id;
-        self.next_table_id += 1;
-        debug!("Assigned table ID {} to table '{}'", table_id, table_name);
-
-        debug!("Logging table creation to WAL");
-        self.log_operation(DataBaseOperation::CreateTable {
-            table_id,
-            name: table_name.clone(),
-        })?;
-
-        self.insert_table(
-            table_id,
-            InternalTableSchema::new(
-                table_id,
-                table_name.clone(),
-                self.internal_state_manager.clone(),
-                self.wal_manager.clone(),
-            ),
+            "expected CheckConstraintUnsupported, got {err:?}"
         );
-        info!(
-            "Table '{}' created successfully with ID {}",
-            table_name, table_id
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inner_join_returns_matching_rows() {
+        use crate::backend::core::search::SearchRequest;
+
+        let dir = std::env::temp_dir().join(format!("ant-db-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+        db.create_table("orders".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let users = db.get_table("users".to_string()).unwrap();
+        let orders = db.get_table("orders".to_string()).unwrap();
+
+        let user_id_col = users
+            .write()
+            .unwrap()
+            .create_column(
+                "id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let user_name_col = users
+            .write()
+            .unwrap()
+            .create_column(
+                "name".to_string(),
+                DataBaseDataType::String,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let order_user_col = orders
+            .write()
+            .unwrap()
+            .create_column(
+                "user_id".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+        let order_amount_col = orders
+            .write()
+            .unwrap()
+            .create_column(
+                "amount".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+
+        let mut alice = AHashMap::new();
+        alice.insert(user_id_col, DataBaseDataEntry::IntegerU64(1));
+        alice.insert(user_name_col, DataBaseDataEntry::String("alice".to_string()));
+        users.read().unwrap().insert_row(alice, &txn, |_, _, _| Ok(true)).unwrap();
+
+        let mut bob = AHashMap::new();
+        bob.insert(user_id_col, DataBaseDataEntry::IntegerU64(2));
+        bob.insert(user_name_col, DataBaseDataEntry::String("bob".to_string()));
+        users.read().unwrap().insert_row(bob, &txn, |_, _, _| Ok(true)).unwrap();
+
+        let mut order = AHashMap::new();
+        order.insert(order_user_col, DataBaseDataEntry::IntegerU64(1));
+        order.insert(order_amount_col, DataBaseDataEntry::IntegerU64(99));
+        orders
+            .read()
+            .unwrap()
+            .insert_row(order, &txn, |_, _, _| Ok(true))
+            .unwrap();
+
+        db.commit_transaction(txn.transaction_id);
+
+        let query_txn = db.create_transaction();
+        let request = SearchRequest::from_sql(
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name",
+        )
+        .unwrap();
+        let results = db.search(&request, &query_txn).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].values.get("name"),
+            Some(&DataBaseDataEntry::String("alice".to_string()))
         );
-        Ok(table_id)
-    }
-
-    fn drop_table(&mut self, table_id: TableId) -> Result<(), DataBaseErrors> {
-        info!("Dropping table {}", table_id);
-        if !self.tables.contains_key(&table_id) {
-            error!("Table not found: {}", table_id);
-            return Err(DataBaseErrors::TableNotFound(table_id.to_string()));
-        }
-        debug!("Logging table drop to WAL");
-        self.log_operation(DataBaseOperation::DropTable { table_id })?;
-        self.remove_table(table_id);
-        info!("Table {} dropped successfully", table_id);
-        Ok(())
-    }
-
-    fn get_table_id(&self, table_name: String) -> Result<TableId, DataBaseErrors> {
-        debug!("geting table if for {table_name}");
-        match self.tables_index.get(&table_name) {
-            None => Err(DataBaseErrors::TableNotFound(table_name)),
-            Some(i) => Ok(*i),
-        }
-    }
-
-    fn get_table_schema(&self, table_id: TableId) -> Result<TableSchema, DataBaseErrors> {
-        debug!("getting table schema for {table_id}");
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => match i.read() {
-                Ok(guard) => guard.get_schema(),
-                Err(e) => {
-                    error!("Failed to acquire read lock for table {}: {}", table_id, e);
-                    Err(DataBaseErrors::WalLockError)
-                }
-            },
-        }
-    }
-
-    fn get_table_size(&self, table_id: TableId) -> Result<usize, DataBaseErrors> {
-        debug!("getting table size for {table_id}");
-        match self.tables.get(&table_id) {
-            None => Err(DataBaseErrors::TableIDNotFound(table_id)),
-            Some(i) => match i.read() {
-                Ok(guard) => Ok(guard.get_size()),
-                Err(e) => {
-                    error!("Failed to acquire read lock for table {}: {}", table_id, e);
-                    Err(DataBaseErrors::WalLockError)
-                }
-            },
-        }
-    }
-
-    fn list_tables(&self) -> Vec<String> {
-        debug!("getting tables list");
-        self.tables_index
-            .iter()
-            .map(|(table_name, _table_id)| table_name.clone())
-            .collect()
-    }
-
-    fn create_column(
-        &self,
-        table_id: TableId,
-        column_name: String,
-        data_type: DataType,
-        constraints: Vec<Constraint>,
-    ) -> Result<ColumnId, DataBaseErrors> {
-        debug!("Creating column '{}' in table {}", column_name, table_id);
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(i) => {
-                debug!("Acquiring write lock for table {}", table_id);
-                match i.write() {
-                    Ok(mut guard) => {
-                        let result =
-                            guard.create_column(column_name.clone(), data_type, constraints);
-                        match &result {
-                            Ok(col_id) => info!(
-                                "Column '{}' created with ID {} in table {}",
-                                column_name, col_id, table_id
-                            ),
-                            Err(e) => error!("Failed to create column '{}': {}", column_name, e),
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
-    }
-
-    fn drop_column(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
-        debug!("Dropping column {} from table {}", column_id, table_id);
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(i) => {
-                debug!("Acquiring write lock for table {}", table_id);
-                match i.write() {
-                    Ok(mut guard) => {
-                        let result = guard.drop_column(column_id);
-                        match &result {
-                            Ok(_) => info!("Column {} dropped from table {}", column_id, table_id),
-                            Err(e) => error!("Failed to drop column {}: {}", column_id, e),
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
-    }
-
-    fn create_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
-        debug!(
-            "Creating index for column {} in table {}",
-            column_id, table_id
+        assert_eq!(
+            results[0].values.get("amount"),
+            Some(&DataBaseDataEntry::IntegerU64(99))
         );
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(i) => {
-                debug!("Acquiring write lock for table {}", table_id);
-                match i.write() {
-                    Ok(mut guard) => {
-                        let result = guard.create_index(column_id);
-                        match &result {
-                            Ok(_) => info!(
-                                "Index created for column {} in table {}",
-                                column_id, table_id
-                            ),
-                            Err(e) => {
-                                error!("Failed to create index for column {}: {}", column_id, e)
-                            }
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn drop_index(&self, table_id: TableId, column_id: ColumnId) -> Result<(), DataBaseErrors> {
-        debug!(
-            "Dropping index for column {} in table {}",
-            column_id, table_id
+    #[test]
+    fn insert_rejects_wrong_column_type() {
+        let dir = std::env::temp_dir().join(format!("ant-db-type-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.database = "testdb".to_string();
+        config.table_data_path = dir.to_string_lossy().to_string();
+
+        let ism = Arc::new(RwLock::new(InternalStateManager::new(config)));
+        let mut db = Database::new("testdb".to_string(), ism);
+        db.create_table("users".to_string()).unwrap();
+
+        let txn = db.create_transaction();
+        let table = db.get_table("users".to_string()).unwrap();
+        let age_col = table
+            .write()
+            .unwrap()
+            .create_column(
+                "age".to_string(),
+                DataBaseDataType::IntegerU64,
+                BTreeSet::new(),
+                &txn,
+            )
+            .unwrap();
+
+        let mut data = AHashMap::new();
+        data.insert(age_col, DataBaseDataEntry::String("not-a-number".to_string()));
+        let err = table
+            .read()
+            .unwrap()
+            .insert_row(data, &txn, |_, _, _| Ok(true))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::backend::errors::DataBaseErrors::DataTypeMismatch(_, _, _)),
+            "expected DataTypeMismatch, got {err:?}"
         );
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(i) => {
-                debug!("Acquiring write lock for table {}", table_id);
-                match i.write() {
-                    Ok(mut guard) => {
-                        let result = guard.drop_index(column_id);
-                        match &result {
-                            Ok(_) => info!(
-                                "Index dropped for column {} in table {}",
-                                column_id, table_id
-                            ),
-                            Err(e) => {
-                                error!("Failed to drop index for column {}: {}", column_id, e)
-                            }
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
-    }
 
-    fn insert_rows(&self, table_id: TableId, rows: Vec<Row>) -> Result<(), DataBaseErrors> {
-        let row_count = rows.len();
-        debug!("Inserting {} rows into table {}", row_count, table_id);
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(i) => {
-                debug!(
-                    "Acquiring write lock for table {} to insert {} rows",
-                    table_id, row_count
-                );
-                match i.write() {
-                    Ok(mut guard) => {
-                        let start_row_id = guard.next_row_id;
-                        let processed_rows = guard.pre_insert_rows(&rows, start_row_id);
-                        match &processed_rows {
-                            Ok(_) => info!("Successfully computed rows"),
-                            Err(e) => error!("Failed computing rows: {}", e),
-                        }
-                        let processed_rows = processed_rows?;
-
-                        let result = guard.insert_rows(processed_rows);
-                        match &result {
-                            Ok(_) => {
-                                guard.next_row_id += row_count as u64;
-                                info!(
-                                    "Successfully inserted {} rows into table {}",
-                                    row_count, table_id
-                                )
-                            }
-                            Err(e) => error!(
-                                "Failed to insert {} rows into table {}: {}",
-                                row_count, table_id, e
-                            ),
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
-    }
-
-    fn delete_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<(), DataBaseErrors> {
-        let row_count = row_ids.len();
-        debug!(
-            "Deleting {} rows from table {}: {:?}",
-            row_count, table_id, row_ids
-        );
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(table_arc) => {
-                debug!(
-                    "Acquiring write lock for table {} to delete {} rows",
-                    table_id, row_count
-                );
-
-                match table_arc.write() {
-                    Ok(mut guard) => {
-                        let validation = guard.pre_delete_rows(&row_ids);
-                        match &validation {
-                            Ok(_) => info!(
-                                "Successfully computed rows to delete from table {}",
-                                table_id
-                            ),
-                            Err(e) => error!(
-                                "Failed to compute rows to delete from table {}: {}",
-                                table_id, e
-                            ),
-                        }
-                        validation?;
-
-                        let result = guard.delete_rows(row_ids);
-                        match &result {
-                            Ok(_) => info!(
-                                "Successfully deleted {} rows from table {}",
-                                row_count, table_id
-                            ),
-                            Err(e) => error!(
-                                "Failed to delete {} rows from table {}: {}",
-                                row_count, table_id, e
-                            ),
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
-    }
-
-    fn update_rows(
-        &self,
-        table_id: TableId,
-        row_ids: Vec<RowId>,
-        new_values: Row,
-    ) -> Result<(), DataBaseErrors> {
-        info!("Updating the rows for {}", table_id);
-        let row_count = row_ids.len();
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(db_arc) => {
-                debug!(
-                    "Acquiring write lock for table {} to update {} rows",
-                    table_id, row_count
-                );
-
-                match db_arc.write() {
-                    Ok(mut guard) => {
-                        let validation_result = guard.pre_update_rows(&row_ids, &new_values);
-                        match &validation_result {
-                            Ok(_) => info!(
-                                "Successfully validated rows to update in table {}",
-                                table_id
-                            ),
-                            Err(e) => error!(
-                                "Failed to validate rows to update in table {}: {}",
-                                table_id, e
-                            ),
-                        }
-                        validation_result?;
-
-                        let result = guard.update_rows(row_ids, new_values);
-                        match &result {
-                            Ok(_) => info!(
-                                "Successfully updated {} rows in table {}",
-                                row_count, table_id
-                            ),
-                            Err(e) => error!(
-                                "Failed to update {} rows in table {}: {}",
-                                row_count, table_id, e
-                            ),
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire write lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
-    }
-
-    fn get_rows(&self, table_id: TableId, row_ids: Vec<RowId>) -> Result<Vec<Row>, DataBaseErrors> {
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(db_arc) => match db_arc.read() {
-                Ok(guard) => {
-                    let result = guard.get_rows(&row_ids);
-                    match &result {
-                        Ok(rows) => {
-                            debug!("Rows({}) retrieved from table {}", rows.len(), table_id)
-                        }
-                        Err(e) => error!("Failed to fetch rows from table {}: {}", table_id, e),
-                    }
-                    result
-                }
-                Err(e) => {
-                    error!("Failed to acquire read lock for table {}: {}", table_id, e);
-                    Err(DataBaseErrors::WalLockError)
-                }
-            },
-        }
-    }
-
-    fn search_rows(
-        &self,
-        table_id: TableId,
-        criteria: Vec<SearchCriteria>,
-        projection: Option<Projection>,
-        sort_by: Option<SortBy>,
-    ) -> Result<Vec<Row>, DataBaseErrors> {
-        debug!(
-            "Searching table {} with {} criteria, projection: {}, sort_by: {}",
-            table_id,
-            criteria.len(),
-            projection.is_some(),
-            sort_by.is_some()
-        );
-        match self.tables.get(&table_id) {
-            None => {
-                error!("Table not found: {}", table_id);
-                Err(DataBaseErrors::TableIDNotFound(table_id))
-            }
-            Some(i) => {
-                debug!("Acquiring read lock for table {} to search", table_id);
-                match i.read() {
-                    Ok(guard) => {
-                        let result = guard.find_row(criteria, projection, sort_by);
-                        match &result {
-                            Ok(rows) => {
-                                info!("Search in table {} returned {} rows", table_id, rows.len())
-                            }
-                            Err(e) => error!("Failed to search table {}: {}", table_id, e),
-                        }
-                        result
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire read lock for table {}: {}", table_id, e);
-                        Err(DataBaseErrors::WalLockError)
-                    }
-                }
-            }
-        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
